@@ -1,3 +1,9 @@
+/* Copyright (c) 2025 ThePedroo. All rights reserved.
+ *
+ * This source code is licensed under the GNU AGPLv3 License found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 #ifndef SLEB128_H
 #define SLEB128_H
 

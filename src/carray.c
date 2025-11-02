@@ -1,4 +1,8 @@
-/* INFO: Just a division for string array */
+/* Copyright (c) 2025 ThePedroo. All rights reserved.
+ *
+ * This source code is licensed under the GNU AGPLv3 License found in the
+ * LICENSE file in the root directory of this source tree.
+ */
 
 #include <stdlib.h>
 #include <stdbool.h>
