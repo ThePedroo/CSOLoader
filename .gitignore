@@ -1,0 +1,12 @@
+*
+
+!include/
+!include/*
+!shareds/
+!shareds/*
+!src/
+!src/*
+!.gitignore
+!LICENSE
+!Makefile
+!README.md
