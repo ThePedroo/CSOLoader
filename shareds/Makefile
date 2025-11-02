@@ -1,10 +1,12 @@
 all:
-	/home/system/Android/Sdk/ndk/29.0.13599879/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang android-shared.c -shared -lm -llog -g -O0
+# This breaks C++ exceptions. Worth researching: -Wl,--no-eh-frame-hdr
+	$(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang++ cpp-shared.cpp -llog -lm -shared -g -O0 -fPIC
 	adb push a.out /data/local/tmp/shared.so
-
-cpp:
-	/home/system/Android/Sdk/ndk/29.0.13599879/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang++ android-cpp-shared.cpp -shared -g -O0
-	adb push a.out /data/local/tmp/shared.so
+	rm a.out
 
 linux:
-	clang linux-shared.c -lelf -shared -g -O0
+	$(CC) linux-shared.c -lelf -shared -g -O0
+
+linux_cpp:
+	$(CXX) cpp-shared.cpp -shared -g -O0 -fPIC
+	mv a.out ../libelf.so
