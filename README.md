@@ -6,7 +6,8 @@ CSOLoader is a traceless and system linker independent SOTA custom linker for An
 
 - C99 compliant
 - System linker independent (no dlopen)
-- Dependencyless (no third-party dependency, except system ones)
+- Dependency-less (no third-party dependency, except system ones)
+- Near complete feature parity to AOSP linker
 
 ## Installation
 
@@ -42,15 +43,49 @@ $ adb shell su -c /data/local/tmp/csoloader /data/local/tmp/shared.so
 
 ## Usage
 
-N/A
+CSOLoader aims to provide a simple API to match the as-simple API that system linkers/libdl provides. Currently, there are only 4 user-facing APIs.
+
+In [csoloader.c](./src/csoloader.c), in `STANDALONE_TEST` `#ifdef`, there is a basic usage of CSOLoader. Usage of CSOLoader's `csoloader_abandon` follows the same as `csoloader_unload`.
 
 ## Documentation
 
-N/A
+1. `bool csoloader_load(struct csoloader *lib, const char *lib_path)`
+
+Loads and links the library into the process' memory, and load the info to the `csoloader` structure for future management. Returns false if operations fails, and performs cleanup automatically.
+
+2. `bool csoloader_unload(struct csoloader *lib)`
+
+Unloads the library from the process' memory from the `csoloader` structure. Returns false if operations fails, and will leak memory if that happens.
+
+3. `bool csoloader_abandon(struct csoloader *lib)`
+
+Frees all internal management handles while allowing it to still continue operation, however, without TLS available. Returns false if operations fails, and will leak memory if that happens.
+
+4. `void *csoloader_get_symbol(struct csoloader *lib, const char *symbol_name)`
+
+Gets the symbol address from the loaded library, won't work if the library has been abandoned. Returns NULL if operation failed.
+
+## Features
+
+- [x] Indirect symbol support 
+- [x] Load and link library's dependencies
+- [x] Full relocation support
+- [x] Android-specific relocations support
+- [x] Memory protection
+- [x] Constructors/Deconstructors calling
+- [x] `libdl` functions support (backtrace, dl_iterate_phdr, dladdr)
+- [x] TLS support
+- [x] (EH) Frame register
+- [x] C++ exceptions support (testing)
+- [ ] MTE (tagged-pointer) support
+- [ ] Support be system linker
+- [ ] `preinit` support (needed to be system linker)
+
+The [testing file for Android](./shareds/cpp-shared.cpp) implements testing for almost all supported functionality.
 
 ## Support
 
-N/A
+Any question or issue related to CSOLoader or other PerformanC projects can be made in [PerformanC's Discord server](https://discord.gg/uPveNfTuCJ).
 
 ## Contribution
 
