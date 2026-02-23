@@ -4,11 +4,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <fcntl.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -112,7 +112,7 @@ bool csoloader_abandon(struct csoloader *lib) {
 }
 
 void *csoloader_get_symbol(struct csoloader *lib, const char *symbol_name) {
-  return csoloader_elf_symb_address(lib->img, symbol_name);
+  return (void *)csoloader_elf_symb_address(lib->img, symbol_name);
 }
 
 #ifdef STANDALONE_TEST
@@ -142,12 +142,12 @@ void *csoloader_get_symbol(struct csoloader *lib, const char *symbol_name) {
     void (*symbol_addr)(void) = csoloader_get_symbol(&lib, symbol_name);
     if (symbol_addr) {
       printf("Found symbol '%s' at address: %p\n", symbol_name, symbol_addr);
+      
+      symbol_addr();
     } else {
       printf("Symbol '%s' not found in library.\n", symbol_name);
     }
-
-    symbol_addr();
-
+  
     if (!csoloader_unload(&lib)) {
       printf("Failed to unload library: %s\n", lib_path);
 

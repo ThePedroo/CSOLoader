@@ -175,6 +175,38 @@ static void _linker_call_destructors(struct csoloader_elf *img) {
   }
 }
 
+static int _linker_protect_gnu_relro(struct csoloader_elf *img) {
+  ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
+  ElfW(Addr) load_bias = (ElfW(Addr))img->base - img->bias;
+  int protected_count = 0;
+
+  for (int i = 0; i < img->header->e_phnum; i++) {
+    if (phdr[i].p_type != PT_GNU_RELRO) continue;
+
+    /* AOSP comment: Tricky: what happens when the relro segment does not start
+                       or end at page boundaries? We're going to be over-protective
+                       here and put every page touched by the segment as read-only. */
+    ElfW(Addr) seg_page_start = _page_start(phdr[i].p_vaddr + load_bias);
+    ElfW(Addr) seg_page_end = _page_end(phdr[i].p_vaddr + phdr[i].p_memsz + load_bias);
+    size_t seg_size = seg_page_end - seg_page_start;
+
+    if (seg_size == 0) continue;
+
+    int ret = mprotect((void *)seg_page_start, seg_size, PROT_READ);
+    if (ret < 0) {
+      LOGW("Failed to mprotect GNU_RELRO at %p (size %zu) in %s: %s", (void *)seg_page_start, seg_size, img->elf, strerror(errno));
+
+      return -1;
+    }
+
+    LOGD("Protected GNU_RELRO region at %p (size %zu) in %s", (void *)seg_page_start, seg_size, img->elf);
+
+    protected_count++;
+  }
+
+  return 0;
+}
+
 static void _linker_internal_init() {
   if (system_page_size != 0) return;
 
@@ -219,7 +251,7 @@ static bool _linker_find_library_path(const char *lib_name, char *full_path, siz
   };
 
   #ifdef __ANDROID__
-    if (strcmp(lib_name, "libc++.so") == 0) {
+    if (strstr(lib_name, "libc++")) {
       LOGD("Forced replacement for using /system/lib64 for libc++.so");
 
       #ifdef __LP64__
@@ -253,11 +285,14 @@ bool linker_init(struct linker *linker, struct csoloader_elf *img) {
   linker->is_linked = false;
   linker->main_map_size = 0;
   linker->dep_count = 0;
+  memset(&linker->tls_indices, 0, sizeof(linker->tls_indices));
 
   memset(linker->dependencies, 0, sizeof(linker->dependencies));
 
   return true;
 }
+
+static void _linker_unregister_tls_segment(struct loaded_dep *dep);
 
 void linker_destroy(struct linker *linker) {
   if (linker->is_linked) {
@@ -279,6 +314,7 @@ void linker_destroy(struct linker *linker) {
     void *dep_base = dep->img->base;
     size_t dep_map_size = dep->map_size;
 
+    _linker_unregister_tls_segment(dep);
     csoloader_elf_destroy(dep->img);
     dep->img = NULL;
     dep->map_size = 0;
@@ -290,6 +326,7 @@ void linker_destroy(struct linker *linker) {
   void *main_base = linker->img->base;
   size_t main_map_size = linker->main_map_size;
 
+  _linker_unregister_tls_segment((struct loaded_dep *)linker);
   csoloader_elf_destroy(linker->img);
   linker->img = NULL;
 
@@ -312,6 +349,7 @@ void linker_abandon(struct linker *linker) {
       unregister_custom_library_for_backtrace(dep->img);
     }
 
+    _linker_unregister_tls_segment(dep);
     csoloader_elf_destroy(dep->img);
     dep->img = NULL;
     dep->map_size = 0;
@@ -322,6 +360,7 @@ void linker_abandon(struct linker *linker) {
     unregister_custom_library_for_backtrace(linker->img);
   }
 
+  _linker_unregister_tls_segment((struct loaded_dep *)linker);
   csoloader_elf_destroy(linker->img);
   linker->img = NULL;
 
@@ -507,6 +546,7 @@ void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out)
 struct linker_symbol_info {
   void *addr;
   struct csoloader_elf *img;
+  struct tls_indices_data *tls_indices;
 };
 
 static struct linker_symbol_info _linker_find_symbol_in_linker_scope(struct linker *linker, const char *sym_name) {
@@ -516,7 +556,8 @@ static struct linker_symbol_info _linker_find_symbol_in_linker_scope(struct link
 
     return (struct linker_symbol_info) {
       .addr = addr,
-      .img = linker->img
+      .img = linker->img,
+      .tls_indices = &linker->tls_indices
     };
   }
 
@@ -528,7 +569,8 @@ static struct linker_symbol_info _linker_find_symbol_in_linker_scope(struct link
 
     return (struct linker_symbol_info) {
       .addr = addr,
-      .img = linker->dependencies[i].img
+      .img = linker->dependencies[i].img,
+      .tls_indices = &linker->dependencies[i].tls_indices
     };
   }
 
@@ -536,11 +578,11 @@ static struct linker_symbol_info _linker_find_symbol_in_linker_scope(struct link
 
   return (struct linker_symbol_info) {
     .addr = NULL,
-    .img = NULL
+    .img = NULL,
+    .tls_indices = NULL
   };
 }
 
-/* TODO: Avoid repetition here */
 #ifdef __aarch64__
   /* INFO: Struct containing information about hardware capabilities used in resolver. This
              struct information is pulled directly from the AOSP code.
@@ -643,116 +685,205 @@ static ElfW(Addr) handle_indirect_symbol(uintptr_t resolver_addr) {
 }
 
 #define MAX_TLS_MODULES 128
+
 struct tls_module {
   size_t module_id;
   size_t align;
   size_t memsz;
   size_t filesz;
-  size_t offset;
-
+  /* INFO: Initial TLS data to copy from .tdata */
   const void *init_image;
-
   struct csoloader_elf *owner;
 };
 
+struct thread_tls {
+  /* INFO: When this was last synced with global generation */
+  size_t generation;
+  /* INFO: Per-module TLS block pointers */
+  void *modules[MAX_TLS_MODULES];
+};
+
 static struct tls_module g_tls_modules[MAX_TLS_MODULES];
-/* INFO: "dlopen" counter for (future) TLS modules. */
-static size_t  g_tls_generation   = 0;
-static size_t  g_tls_static_size = 0;
-static size_t  g_tls_static_align_max = 1;
+static size_t g_tls_generation = 0;
+static pthread_mutex_t g_tls_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_key_t g_tls_key;
+static pthread_once_t g_tls_key_once = PTHREAD_ONCE_INIT;
+
+/* INFO: This structure is used to access thread-local storage (TLS) variables. 
+           It cannot and should not have its members modified. */
+struct tls_index {
+  unsigned long module;
+  unsigned long offset;
+};
+
+static void _linker_destroy_thread_tls(void *arg) {
+  struct thread_tls *ttls = (struct thread_tls *)arg;
+  if (!ttls) return;
+
+  for (size_t i = 1; i < MAX_TLS_MODULES; i++) {
+    if (!ttls->modules[i]) continue;
+
+    free(ttls->modules[i]);
+    ttls->modules[i] = NULL;
+  }
+
+  free(ttls);
+}
+
+static void _linker_alloc_tls_key_once(void) {
+  pthread_key_create(&g_tls_key, _linker_destroy_thread_tls);
+}
+
+static void *_linker_allocate_module_tls(struct tls_module *mod) {
+  if (!mod || mod->module_id == 0 || mod->memsz == 0) return NULL;
+
+  size_t align = mod->align;
+  /* INFO: posix_memalign requires alignment >= sizeof(void *) and power of 2 */
+  if (align < sizeof(void *)) align = sizeof(void *);
+  if (system_page_size > 0 && align > system_page_size) align = system_page_size;
+
+  void *block = NULL;
+  if (posix_memalign(&block, align, mod->memsz) != 0) {
+    LOGE("Failed to allocate TLS block for module %zu: size=%zu, align=%zu", mod->module_id, mod->memsz, align);
+
+    return NULL;
+  }
+
+  /* INFO: Zero the block first (.tbss), then copy initialized data (.tdata) */
+  memset(block, 0, mod->memsz);
+  if (mod->init_image && mod->filesz > 0)
+    memcpy(block, mod->init_image, mod->filesz);
+
+  return block;
+}
+
+static struct thread_tls *_linker_get_thread_tls(void) {
+  pthread_once(&g_tls_key_once, _linker_alloc_tls_key_once);
+
+  struct thread_tls *ttls = (struct thread_tls *)pthread_getspecific(g_tls_key);
+  if (!ttls) {
+    ttls = (struct thread_tls *)calloc(1, sizeof(struct thread_tls));
+    if (!ttls) {
+      LOGE("Failed to allocate thread TLS state");
+
+      return NULL;
+    }
+
+    ttls->generation = 0;
+
+    pthread_setspecific(g_tls_key, ttls);
+  }
+
+  return ttls;
+}
+
+static void _linker_sync_thread_tls(struct thread_tls *ttls) {
+  pthread_mutex_lock(&g_tls_mutex);
+  size_t current_gen = g_tls_generation;
+  pthread_mutex_unlock(&g_tls_mutex);
+
+  if (ttls->generation >= current_gen) return;
+
+  for (size_t i = 1; i < MAX_TLS_MODULES; i++) {
+    struct tls_module *mod = &g_tls_modules[i];
+    if (mod->module_id != 0 || !ttls->modules[i]) continue;
+
+    free(ttls->modules[i]);
+    ttls->modules[i] = NULL;
+  }
+
+  ttls->generation = current_gen;
+}
 
 static bool _linker_register_tls_segment(struct csoloader_elf *img) {
   if (!img->tls_segment) return true;
+
+  pthread_mutex_lock(&g_tls_mutex);
 
   size_t mod_id;
   for (mod_id = 1; mod_id < MAX_TLS_MODULES; mod_id++) {
     if (g_tls_modules[mod_id].module_id == 0) break;
   }
 
-  /* TODO: Allow limitless TLS modules by dynamically allocating more space */
   if (mod_id == MAX_TLS_MODULES) {
-    LOGE("TLS module overflow");
+    LOGE("TLS module overflow: max %d modules reached", MAX_TLS_MODULES);
+
+    pthread_mutex_unlock(&g_tls_mutex);
 
     return false;
   }
 
-  struct tls_module *m = &g_tls_modules[mod_id];
-  m->module_id  = mod_id;
-  m->align      = img->tls_segment->p_align ? img->tls_segment->p_align : 1;
-  m->memsz      = img->tls_segment->p_memsz;
-  m->filesz     = img->tls_segment->p_filesz;
-  m->init_image = (const void *)((uintptr_t)img->base + img->tls_segment->p_vaddr - img->bias);
-  m->owner      = img;
-
-  g_tls_static_size = ALIGN_UP(g_tls_static_size, m->align);
-  m->offset         = g_tls_static_size;
-  g_tls_static_size += m->memsz;
-
-  if (m->align > g_tls_static_align_max)
-    g_tls_static_align_max = m->align;
+  struct tls_module *mod = &g_tls_modules[mod_id];
+  mod->module_id  = mod_id;
+  mod->align      = img->tls_segment->p_align ? img->tls_segment->p_align : 1;
+  mod->memsz      = img->tls_segment->p_memsz;
+  mod->filesz     = img->tls_segment->p_filesz;
+  mod->init_image = (const void *)((uintptr_t)img->base + img->tls_segment->p_vaddr - img->bias);
+  mod->owner      = img;
 
   img->tls_mod_id = mod_id;
+  g_tls_generation++;
+
+  LOGD("Registered TLS module %zu for %s: memsz=%zu, filesz=%zu, align=%zu", mod_id, img->elf, mod->memsz, mod->filesz, mod->align);
+
+  pthread_mutex_unlock(&g_tls_mutex);
 
   return true;
 }
 
-static pthread_key_t g_tls_key;
-static pthread_once_t g_tls_key_once = PTHREAD_ONCE_INIT;
+static void _linker_unregister_tls_segment(struct loaded_dep *dep) {
+  if (!dep->img || dep->img->tls_mod_id == 0) return;
 
-static void _linker_alloc_tls_key_once(void) {
-  pthread_key_create(&g_tls_key, free);
-}
+  pthread_mutex_lock(&g_tls_mutex);
 
-static void *_linker_allocate_tls_for_thread(void) {
-  pthread_once(&g_tls_key_once, _linker_alloc_tls_key_once);
+  size_t mod_id = dep->img->tls_mod_id;
+  if (mod_id < MAX_TLS_MODULES && g_tls_modules[mod_id].owner == dep->img) {
+    LOGD("Unregistering TLS module %zu for %s", mod_id, dep->img->elf);
 
-  size_t align = g_tls_static_align_max;
-  if (align == 0) align = sizeof(void *);
-  if (align > system_page_size) align = system_page_size;
+    memset(&g_tls_modules[mod_id], 0, sizeof(struct tls_module));
+    dep->img->tls_mod_id = 0;
 
-  size_t total_size = g_tls_static_size + align;
-  void *block_raw = NULL;
-  if (posix_memalign(&block_raw, align, total_size) != 0) {
-    LOGE("Failed to allocate aligned TLS block: size=%zu, align=%zu", total_size, align);
-
-    return NULL;
-  }
-  memset(block_raw, 0, total_size);
-
-  char *block = (char *)block_raw;
-  for (int i = 1; i < MAX_TLS_MODULES; ++i) {
-    struct tls_module *m = &g_tls_modules[i];
-    if (!m->owner || !m->init_image || m->filesz == 0) continue;
-
-    memcpy(block + m->offset, m->init_image, m->filesz);
+    g_tls_generation++;
   }
 
-  pthread_setspecific(g_tls_key, block);
-
-  return block;
+  pthread_mutex_unlock(&g_tls_mutex);
+  
+  /* INFO: Free all tracked tls_index structures */
+  if (dep->tls_indices.count != 0) {
+    for (size_t i = 0; i < dep->tls_indices.count; i++) {
+      free(dep->tls_indices.indices[i]);
+    }
+    
+    free(dep->tls_indices.indices);
+    dep->tls_indices.indices = NULL;
+    dep->tls_indices.count = 0;
+    dep->tls_indices.capacity = 0;
+  }
 }
 
-static inline void *_linker_tls_block_for_current_thread(void) {
-  pthread_once(&g_tls_key_once, _linker_alloc_tls_key_once);
+static bool _track_tls_index(struct tls_indices_data *tls_indices, struct tls_index *ti) {
+  if (!tls_indices || !ti) return false;
 
-  void *p = pthread_getspecific(g_tls_key);
-  if (!p) {
-    LOGD("No TLS block found for current thread %llu, allocating new one", (unsigned long long)pthread_self());
+  if (tls_indices->count >= tls_indices->capacity) {
+    size_t new_cap = tls_indices->capacity == 0 ? 8 : tls_indices->capacity * 2;
+    void **new_arr = realloc(tls_indices->indices, new_cap * sizeof(void *));
+    if (!new_arr) {
+      LOGE("Failed to grow tls_indices array");
 
-    p = _linker_allocate_tls_for_thread();
+      return false;
+    }
+
+    tls_indices->indices = new_arr;
+    tls_indices->capacity = new_cap;
   }
 
-  return p;
+  tls_indices->indices[tls_indices->count++] = ti;
+
+  return true;
 }
 
-/* INFO: This structure is used to access thread-local storage (TLS) variables. 
-           It cannot and should not have its members modified.  */
-struct tls_index {
-  unsigned long module;
-  unsigned long offset;
-};
-
-static struct tls_index *allocate_tls_index_for_symbol(struct csoloader_elf *img, ElfW(Sym) *dynsym, uint32_t sym_idx, ElfW(Addr) addend) {
+static struct tls_index *allocate_tls_index_for_symbol(struct csoloader_elf *img, struct tls_indices_data *tls_indices, ElfW(Sym) *dynsym, uint32_t sym_idx, ElfW(Addr) addend) {
   struct tls_index *ti = malloc(sizeof(*ti));
   if (!ti) {
     LOGE("Failed to allocate memory for tls_index");
@@ -765,25 +896,84 @@ static struct tls_index *allocate_tls_index_for_symbol(struct csoloader_elf *img
   ElfW(Sym) *sym = &dynsym[sym_idx];
   ti->offset = sym->st_value + addend;
 
+  if (!_track_tls_index(tls_indices, ti)) {
+    LOGW("Failed to track tls_index for cleanup - potential memory leak");
+  }
+
   return ti;
 }
 
 void *__tls_get_addr(struct tls_index *ti) {
-  void *block = _linker_tls_block_for_current_thread();
-  if (!block) {
-    LOGE("Library tried to access TLS, but allocation failed");
-
-    return NULL;
-  }
+  LOGD("__tls_get_addr called: ti=%p, module=%zu, offset=%zu", ti, ti->module, ti->offset);
 
   size_t mod_id = ti->module;
-  if (mod_id == 0 || mod_id >= MAX_TLS_MODULES || g_tls_modules[mod_id].module_id == 0) {
+
+  if (mod_id == 0 || mod_id >= MAX_TLS_MODULES) {
     LOGE("Library tried to access invalid TLS module ID %zu", mod_id);
 
     return NULL;
   }
 
-  return (uint8_t *)block + g_tls_modules[mod_id].offset + ti->offset;
+  pthread_mutex_lock(&g_tls_mutex);
+
+  struct tls_module *mod = &g_tls_modules[mod_id];
+  if (mod->module_id == 0) {
+    pthread_mutex_unlock(&g_tls_mutex);
+
+    LOGE("Library tried to access unregistered TLS module %zu", mod_id);
+
+    return NULL;
+  }
+
+  pthread_mutex_unlock(&g_tls_mutex);
+
+  struct thread_tls *ttls = _linker_get_thread_tls();
+  if (!ttls) {
+    LOGE("Library tried to access TLS, but thread TLS allocation failed");
+
+    return NULL;
+  }
+
+  _linker_sync_thread_tls(ttls);
+
+  pthread_mutex_lock(&g_tls_mutex);
+
+  if (!ttls->modules[mod_id]) {
+    ttls->modules[mod_id] = _linker_allocate_module_tls(mod);
+    if (!ttls->modules[mod_id]) {
+      pthread_mutex_unlock(&g_tls_mutex);
+
+      LOGE("Failed to allocate TLS block for module %zu on thread %llu", mod_id, (unsigned long long)pthread_self());
+
+      return NULL;
+    }
+  }
+
+  pthread_mutex_unlock(&g_tls_mutex);
+
+  return (uint8_t *)ttls->modules[mod_id] + ti->offset;
+}
+
+static inline ElfW(Addr) _linker_get_tpidr(void) {
+  #if defined(__aarch64__)
+    /* INFO: ARM64 uses the TPIDR_EL0 register to store the thread pointer */
+    ElfW(Addr) tpidr;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tpidr));
+
+    return tpidr;
+  #elif defined(__arm__)
+    /* INFO: ARM32 uses a different method, CP15 register */
+    ElfW(Addr) tpidr;
+    __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(tpidr));
+
+    return tpidr;
+  #elif defined(__i386__) || defined(__x86_64__)
+    /* INFO: x86 uses segment registers, but TLSDESC is not used on x86 */
+
+    return 0;
+  #else
+    return 0;
+  #endif
 }
 
 struct _linker_unified_r {
@@ -793,47 +983,67 @@ struct _linker_unified_r {
   ElfW(Addr) r_addend;
 };
 
-static ElfW(Addr) dynamic_tls_resolver(struct tls_index *arg) {
-  void *addr = __tls_get_addr(arg);
+static ElfW(Addr) dynamic_tls_resolver(ElfW(Addr) *desc) {
+  /* INFO: desc[0] = resolver (this function), desc[1] = our tls_index pointer */
+  struct tls_index *ti = (struct tls_index *)desc[1];
 
-  return (ElfW(Addr))addr - (ElfW(Addr))_linker_tls_block_for_current_thread();
+  void *addr = __tls_get_addr(ti);
+  if (!addr) {
+    LOGE("dynamic_tls_resolver: __tls_get_addr failed for module=%zu, offset=%zu", ti->module, ti->offset);
+
+    return 0;
+  }
+
+  /* INFO: Calculate offset from tpidr_el0 so that we get the actual address of the TLS variable */
+  ElfW(Addr) tpidr = _linker_get_tpidr();
+  ElfW(Addr) result = (ElfW(Addr))addr - tpidr;
+  
+  LOGD("Dynamically resolved tls_index: desc=%p, ti=%p, module=%zu, offset=%zu, addr=%p, tpidr=0x%lx, returning=0x%lx", desc, ti, ti->module, ti->offset, addr, (unsigned long)tpidr, (unsigned long)result);
+  
+  return result;
 }
 
-static void _linker_process_unified_relocation(struct linker *linker, struct csoloader_elf *image, struct _linker_unified_r *r, ElfW(Addr) load_bias, ElfW(Sym) *dynsym, char *dynstr, bool is_rela) {
+static ElfW(Addr) tlsdesc_resolver_unresolved_weak(ElfW(Addr) *desc) {
+  ElfW(Addr) addend = desc[1];
+  ElfW(Addr) tpidr = _linker_get_tpidr();
+  ElfW(Addr) result = addend - tpidr;
+  
+  LOGD("Resolver for unresolved weak: addend=%zu, tpidr=0x%lx, returning=0x%lx", (size_t)addend, (unsigned long)tpidr, (unsigned long)result);
+  
+  return result;
+}
+
+static void _linker_process_unified_relocation(struct linker *linker, struct loaded_dep *dep, struct _linker_unified_r *r, ElfW(Addr) load_bias, ElfW(Sym) *dynsym, char *dynstr, bool is_rela) {
   ElfW(Addr) *target_addr = (ElfW(Addr) *)(load_bias + r->r_offset);
 
   switch (r->type) {
     case R_GENERIC_NONE: {
-      LOGD("Skipping R_GENERIC_NONE relocation at %p in %s", target_addr, image->elf);
+      LOGD("Skipping R_GENERIC_NONE relocation at %p in %s", target_addr, dep->img->elf);
 
       break;
     }
     case R_GENERIC_COPY: {
-      LOGW("R_GENERIC_COPY relocation at %p in %s: This relocation type is not supported yet", target_addr, image->elf);
+      LOGW("R_GENERIC_COPY relocation at %p in %s: This relocation type is not supported yet", target_addr, dep->img->elf);
 
       break;
     }
     case R_GENERIC_IRELATIVE: {
       *target_addr = handle_indirect_symbol(load_bias + (is_rela ? r->r_addend : *(ElfW(Addr) *)(target_addr)));
 
-      LOGD("R_GENERIC_IRELATIVE relocation at %p in %s: Resolved to %p", target_addr, image->elf, (void *)*target_addr);
+      LOGD("R_GENERIC_IRELATIVE relocation at %p in %s: Resolved to %p", target_addr, dep->img->elf, (void *)*target_addr);
 
       break;
     }
     case R_GENERIC_RELATIVE: {
       *target_addr = load_bias + (is_rela ? r->r_addend : *(ElfW(Addr) *)(target_addr));
 
-      LOGD("R_GENERIC_RELATIVE relocation at %p in %s: Resolved to %p", target_addr, image->elf, (void *)*target_addr);
+      LOGD("R_GENERIC_RELATIVE relocation at %p in %s: Resolved to %p", target_addr, dep->img->elf, (void *)*target_addr);
 
       break;
     }
     case R_GENERIC_GLOB_DAT:
     case R_GENERIC_ABSOLUTE:
     case R_GENERIC_JUMP_SLOT:
-    case R_GENERIC_TLS_DTPMOD:
-    case R_GENERIC_TLS_DTPREL:
-    case R_GENERIC_TLSDESC:
-    case R_GENERIC_TLS_TPREL:
     #ifdef __x86_64__
       case R_X86_64_32:
       case R_X86_64_PC32:
@@ -844,85 +1054,50 @@ static void _linker_process_unified_relocation(struct linker *linker, struct cso
       const char *sym_name = dynstr + dynsym[r->sym_idx].st_name;
       struct linker_symbol_info sym = _linker_find_symbol_in_linker_scope(linker, sym_name);
       if (!sym.addr) {
-        LOGE("Symbol '%s' not found for relocation in %s", sym_name, image->elf);
+        LOGE("Symbol '%s' not found for relocation in %s", sym_name, dep->img->elf);
 
         return;
       }
 
       if (strcmp(sym_name, "dl_iterate_phdr") == 0) {
-        LOGD("Special case for dl_iterate_phdr: using linker->img->base instead of sym.addr");
+        LOGD("Special case for dl_iterate_phdr: using custom implementation");
 
-        *target_addr = custom_dl_iterate_phdr;
+        *target_addr = (ElfW(Addr))custom_dl_iterate_phdr;
 
         return;
       }
 
       if (strcmp(sym_name, "dladdr") == 0) {
-        LOGD("Special case for dladdr: using linker->img->base instead of sym.addr");
+        LOGD("Special case for dladdr: using custom implementation");
 
-        *target_addr = custom_dladdr;
+        *target_addr = (ElfW(Addr))custom_dladdr;
+
+        return;
+      }
+
+      if (strcmp(sym_name, "__tls_get_addr") == 0) {
+        LOGD("Special case for __tls_get_addr: using custom TLS implementation");
+
+        *target_addr = (ElfW(Addr))__tls_get_addr;
 
         return;
       }
 
       switch (r->type) {
         case R_GENERIC_GLOB_DAT:
-        case R_GENERIC_ABSOLUTE:
         case R_GENERIC_JUMP_SLOT: {
-          *target_addr = (ElfW(Addr))sym.addr + (r->type == R_GENERIC_ABSOLUTE && is_rela ? *(ElfW(Addr) *)target_addr : 0);
+          ElfW(Addr) addend = is_rela ? r->r_addend : 0;
+          *target_addr = (ElfW(Addr))sym.addr + addend;
 
-          LOGD("%s relocation at %p in %s: symbol '%s' resolved to %p",
-               r->type == R_GENERIC_GLOB_DAT ? "R_GENERIC_GLOB_DAT" :
-               r->type == R_GENERIC_ABSOLUTE ? "R_GENERIC_ABSOLUTE" :
-               r->type == R_GENERIC_JUMP_SLOT ? "R_GENERIC_JUMP_SLOT" : "Unknown",
-               target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("%s relocation at %p in %s: symbol '%s' resolved to %p", r->type == R_GENERIC_GLOB_DAT ? "R_GENERIC_GLOB_DAT" : "R_GENERIC_JUMP_SLOT", target_addr, dep->img->elf, sym_name, (void *)*target_addr);
 
           break;
         }
-        /* TODO: This TLS implementation is a SHIT and wrong */
-        case R_GENERIC_TLS_DTPMOD: {
-          *target_addr = sym.img->tls_segment ? sym.img->tls_mod_id : 0;
+        case R_GENERIC_ABSOLUTE: {
+          ElfW(Addr) addend = is_rela ? r->r_addend : *(ElfW(Addr) *)target_addr;
+          *target_addr = (ElfW(Addr))sym.addr + addend;
 
-          LOGD("TLS: R_GENERIC_TLS_DTPMOD relocation at %p in %s: symbol '%s' resolved to module ID %p", target_addr, image->elf, sym_name, (void *)*target_addr);
-
-          break;
-        }
-        case R_GENERIC_TLS_DTPREL: {
-          ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
-          *target_addr = sym_ent->st_value + r->r_addend;
-
-
-          LOGD("TLS: R_GENERIC_TLS_DTPREL relocation at %p in %s: symbol '%s' resolved to addend %p", target_addr, image->elf, sym_name, (void *)*target_addr);
-
-          break;
-        }
-        case R_GENERIC_TLSDESC: {
-          /* INFO: ti is not owned by this function. It will be freed outside. */
-          struct tls_index *ti = allocate_tls_index_for_symbol(sym.img, dynsym, r->sym_idx, r->r_addend);
-          if (!ti) {
-              LOGE("Failed to allocate TlsIndex for TLSDESC symbol in %s", image->elf);
-              return;
-          }
-
-          ElfW(Addr) *desc = target_addr;
-          desc[0] = (ElfW(Addr))&dynamic_tls_resolver;
-          desc[1] = (ElfW(Addr))ti;
-
-          LOGD("TLS: R_GENERIC_TLSDESC relocation at %p in %s: symbol '%s' resolved to resolver %p with arg %p", target_addr, image->elf, sym_name, (void *)desc[0], (void *)desc[1]);
-
-          break;
-        }
-        case R_GENERIC_TLS_TPREL: {
-          ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
-          struct tls_index ti = {
-            .module = sym.img->tls_mod_id,
-            .offset = sym_ent->st_value + r->r_addend
-          };
-
-          void *var_addr = __tls_get_addr(&ti);
-          *target_addr = (ElfW(Addr))var_addr - (ElfW(Addr))_linker_tls_block_for_current_thread();
-
-          LOGD("TLS: R_GENERIC_TLS_TPREL relocation at %p in %s: symbol '%s' resolved to %p", target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("R_GENERIC_ABSOLUTE relocation at %p in %s: symbol '%s' resolved to %p", target_addr, dep->img->elf, sym_name, (void *)*target_addr);
 
           break;
         }
@@ -930,22 +1105,23 @@ static void _linker_process_unified_relocation(struct linker *linker, struct cso
         case R_X86_64_32: {
           *target_addr = (ElfW(Addr))sym.addr + r->r_addend;
 
-          LOGD("R_X86_64_32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("R_X86_64_32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, dep->img->elf, sym_name, (void *)*target_addr);
 
           break;
         }
         case R_X86_64_PC32: {
           *target_addr = (ElfW(Addr))sym.addr + r->r_addend - (ElfW(Addr))target_addr;
 
-          LOGD("R_X86_64_PC32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("R_X86_64_PC32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, dep->img->elf, sym_name, (void *)*target_addr);
 
           break;
         }
         #elif defined(__i386__)
         case R_386_PC32: {
-          *target_addr = (ElfW(Addr))sym.addr + (is_rela ? *(ElfW(Addr) *)(target_addr) : r->r_addend) - (ElfW(Addr))target_addr;
+          ElfW(Addr) addend = is_rela ? r->r_addend : *(ElfW(Addr) *)target_addr;
+          *target_addr = (ElfW(Addr))sym.addr + addend - (ElfW(Addr))target_addr;
 
-          LOGD("R_386_PC32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("R_386_PC32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, dep->img->elf, sym_name, (void *)*target_addr);
 
           break;
         }
@@ -953,32 +1129,210 @@ static void _linker_process_unified_relocation(struct linker *linker, struct cso
       }
       break;
     }
+    case R_GENERIC_TLS_DTPMOD: {
+      struct csoloader_elf *tls_img = NULL;
+      size_t module_id = 0;
+      
+      if (r->sym_idx == 0) {
+        /* INFO: If not referenced, assume current module */
+        tls_img = dep->img;
+      } else {
+        ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
+        uint8_t bind = ELF_ST_BIND(sym_ent->st_info);
+        
+        if (bind == STB_LOCAL) {
+          LOGE("Unexpected TLS reference to STB_LOCAL symbol in %s", dep->img->elf);
+
+          return;
+        }
+        
+        const char *sym_name = dynstr + sym_ent->st_name;
+        struct linker_symbol_info sym = _linker_find_symbol_in_linker_scope(linker, sym_name);
+        
+        if (!sym.img && bind != STB_WEAK) {
+          LOGE("TLS symbol '%s' not found in %s", sym_name, dep->img->elf);
+
+          return;
+        }
+        
+        /* INFO: NULLs are allowed for unresolved WEAKs */
+        tls_img = sym.img;
+      }
+      
+      if (tls_img && tls_img->tls_segment) module_id = tls_img->tls_mod_id;
+      *target_addr = module_id;
+
+      LOGD("TLS: R_GENERIC_TLS_DTPMOD at %p in %s: module_id=%zu", target_addr, dep->img->elf, module_id);
+
+      break;
+    }
+    case R_GENERIC_TLS_DTPREL: {
+      ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
+      ElfW(Addr) offset = sym_ent->st_value + r->r_addend;
+      *target_addr = offset;
+
+      LOGD("TLS: R_GENERIC_TLS_DTPREL at %p in %s: offset=%zu", target_addr, dep->img->elf, (size_t)offset);
+
+      break;
+    }
+    case R_GENERIC_TLSDESC: {
+      struct csoloader_elf *tls_img = NULL;
+      struct tls_indices_data *target_tls_indices = NULL;
+      ElfW(Addr) *desc = target_addr;
+      
+      if (r->sym_idx == 0) {
+        /* INFO: If not referenced, assume current module */
+        tls_img = dep->img;
+        target_tls_indices = &dep->tls_indices;
+      } else {
+        ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
+        uint8_t bind = ELF_ST_BIND(sym_ent->st_info);
+        
+        if (bind == STB_LOCAL) {
+          LOGE("Unexpected TLS reference to STB_LOCAL symbol in %s", dep->img->elf);
+
+          return;
+        }
+        
+        const char *sym_name = dynstr + sym_ent->st_name;
+        struct linker_symbol_info sym = _linker_find_symbol_in_linker_scope(linker, sym_name);
+        if (!sym.img) {
+          if (bind != STB_WEAK)  {
+            LOGE("TLS symbol '%s' not found for TLSDESC in %s", sym_name, dep->img->elf);
+  
+            return;
+          }
+
+          /* INFO: Unresolved weak. Setup resolver that returns -tpidr + addend
+                      so result is NULL + addend */
+          desc[0] = (ElfW(Addr))&tlsdesc_resolver_unresolved_weak;
+          desc[1] = r->r_addend;
+
+          LOGD("TLS: R_GENERIC_TLSDESC at %p in %s: unresolved weak, addend=%zu", target_addr, dep->img->elf, (size_t)r->r_addend);
+
+          break;
+        }
+
+        tls_img = sym.img;
+        target_tls_indices = sym.tls_indices;
+      }
+      
+      if (!tls_img || !tls_img->tls_segment) {
+        LOGE("TLSDESC refers to module with no TLS segment in %s", dep->img->elf);
+
+        return;
+      }
+
+      struct tls_index *ti = allocate_tls_index_for_symbol(tls_img, target_tls_indices, dynsym, r->sym_idx, r->r_addend);
+      if (!ti) {
+        LOGE("Failed to allocate tls_index for TLSDESC in %s", dep->img->elf);
+
+        return;
+      }
+
+      desc[0] = (ElfW(Addr))&dynamic_tls_resolver;
+      desc[1] = (ElfW(Addr))ti;
+
+      LOGD("TLS: R_GENERIC_TLSDESC at %p in %s: resolver=%p, ti={mod=%zu,off=%zu}", target_addr, dep->img->elf, (void *)desc[0], ti->module, (size_t)ti->offset);
+
+      break;
+    }
+    case R_GENERIC_TLS_TPREL: {
+      /* AOSP INFO: TLS symbol in dlopened library referenced using IE access model.
+         
+         INFO: Since CSOLoader only handles dlopen'd libraries, we cannot support
+                 true static TLS. However, we can emulate by computing offset from tpidr. */
+      struct csoloader_elf *tls_img = NULL;
+      struct tls_indices_data *target_tls_indices = NULL;
+      ElfW(Addr) tpoff = 0;
+      
+      if (r->sym_idx == 0) {
+        /* INFO: If not referenced, assume current module */
+        tls_img = dep->img;
+        target_tls_indices = &dep->tls_indices;
+      } else {
+        ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
+        uint8_t bind = ELF_ST_BIND(sym_ent->st_info);        
+        if (bind == STB_LOCAL) {
+          LOGE("Unexpected TLS reference to STB_LOCAL symbol in %s", dep->img->elf);
+
+          return;
+        }
+        
+        const char *sym_name = dynstr + sym_ent->st_name;
+        struct linker_symbol_info sym = _linker_find_symbol_in_linker_scope(linker, sym_name);
+        if (!sym.img) {
+          if (bind != STB_WEAK) {
+            LOGE("TLS symbol '%s' not found for TPREL in %s", sym_name, dep->img->elf);
+  
+            return;
+          }
+            
+          /* INFO: Unresolved weak. tpoff=0 so &symbol resolves to tpidr (thread pointer) */
+          *target_addr = 0;
+
+          LOGD("TLS: R_GENERIC_TLS_TPREL at %p in %s: unresolved weak, tpoff=0", target_addr, dep->img->elf);
+
+          break;
+        }
+
+        tls_img = sym.img;
+        target_tls_indices = sym.tls_indices;
+      }
+      
+      if (!tls_img || !tls_img->tls_segment) {
+        LOGE("TLS_TPREL refers to module with no TLS segment in %s", dep->img->elf);
+
+        return;
+      }
+
+      ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
+      struct tls_index ti = {
+        .module = tls_img->tls_mod_id,
+        .offset = sym_ent->st_value + r->r_addend
+      };
+
+      void *var_addr = __tls_get_addr(&ti);
+      if (!var_addr) {
+        LOGE("TLS: Failed to get TLS address for TPREL in %s", dep->img->elf);
+
+        return;
+      }
+      
+      /* INFO: Store offset from tpidr so that tpidr + offset = var_addr */
+      ElfW(Addr) tpidr = _linker_get_tpidr();
+      tpoff = (ElfW(Addr))var_addr - tpidr;
+      *target_addr = tpoff;
+
+      LOGD("TLS: R_GENERIC_TLS_TPREL at %p in %s: tpoff=0x%lx (addr=%p, tpidr=0x%lx)", target_addr, dep->img->elf, (unsigned long)tpoff, var_addr, (unsigned long)tpidr);
+
+      break;
+    }
     default: {
       LOGF("Unsupported relocation type: %d in %s.\n - Symbol index: %d\n - Symbol name: %s\n - Offset: %p\n - Addend: %p",
-           r->type, image->elf, r->sym_idx, dynstr + dynsym[r->sym_idx].st_name,
+           r->type, dep->img->elf, r->sym_idx, dynstr + dynsym[r->sym_idx].st_name,
            target_addr, (void *)r->r_addend);
     }
   }
 }
 
-static void _linker_process_relocations(struct linker *linker, struct csoloader_elf *image) {
-  ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)image->header + image->header->e_phoff);
+static void _linker_process_relocations(struct linker *linker, struct loaded_dep *dep) {
+  ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)dep->img->header + dep->img->header->e_phoff);
   ElfW(Dyn) *dyn = NULL;
-  for (int i = 0; i < image->header->e_phnum; i++) {
+  for (int i = 0; i < dep->img->header->e_phnum; i++) {
     if (phdr[i].p_type != PT_DYNAMIC) continue;
 
-    dyn = (ElfW(Dyn) *)((uintptr_t)image->base + phdr[i].p_vaddr - image->bias);
+    dyn = (ElfW(Dyn) *)((uintptr_t)dep->img->base + phdr[i].p_vaddr - dep->img->bias);
 
     break;
   }
 
   if (!dyn) {
-    LOGD("No DYNAMIC section found in %s", image->elf);
+    LOGD("No DYNAMIC section found in %s", dep->img->elf);
 
     return;
   }
 
-  /* TODO: Add support for RELRO */
   /* TODO: (CRITICAL) Add support for MTE to allow linker to link
              in arm v9 devices, without a crash. */
 
@@ -1009,10 +1363,10 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
   ElfW(Sym) *dynsym = NULL;
   char *dynstr = NULL;
   int pltrel_type = 0;
-  ElfW(Addr) load_bias = (ElfW(Addr))image->base - image->bias;
+  ElfW(Addr) load_bias = (ElfW(Addr))dep->img->base - dep->img->bias;
 
   for (ElfW(Dyn) *d = dyn; d->d_tag != DT_NULL; ++d) {
-    uintptr_t ptr_val = (uintptr_t)image->base + d->d_un.d_ptr - image->bias;
+    uintptr_t ptr_val = (uintptr_t)dep->img->base + d->d_un.d_ptr - dep->img->bias;
 
     switch (d->d_tag) {
       case DT_RELA:           rela = (ElfW(Rela) *)ptr_val; break;
@@ -1038,7 +1392,7 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
         case DT_ANDROID_RELRSZ: relr_sz = d->d_un.d_val; break;
         case DT_ANDROID_RELRENT: {
           if (d->d_un.d_val != sizeof(ElfW(Addr))) {
-            LOGF("Unsupported DT_ANDROID_RELRENT size %zu in %s", (size_t)d->d_un.d_val, image->elf);
+            LOGF("Unsupported DT_ANDROID_RELRENT size %zu in %s", (size_t)d->d_un.d_val, dep->img->elf);
 
             return;
           }
@@ -1050,19 +1404,18 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
   }
 
   if (!dynsym || !dynstr) {
-    LOGE("Could not find DT_SYMTAB or DT_STRTAB in %s", image->elf);
+    LOGE("Could not find DT_SYMTAB or DT_STRTAB in %s", dep->img->elf);
 
     return;
   }
 
   if (relr) {
-    LOGD("Processing RELR relocations for %s", image->elf);
+    LOGD("Processing RELR relocations for %s", dep->img->elf);
 
-    const size_t word_size = sizeof(ElfW(Addr));
-    const size_t bits_per_entry = word_size * 8;
+    const size_t bits_per_entry = sizeof(ElfW(Addr)) * 8;
     ElfW(Addr) *relr_entries = relr;
-    size_t relr_count = relr_sz / word_size;
-    ElfW(Addr) load_bias = (ElfW(Addr))image->base - image->bias;
+    size_t relr_count = relr_sz / sizeof(ElfW(Addr));
+    ElfW(Addr) load_bias = (ElfW(Addr))dep->img->base - dep->img->bias;
     ElfW(Addr) base_offset = 0;
 
     for (size_t i = 0; i < relr_count; i++) {
@@ -1074,7 +1427,7 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
         ElfW(Addr) *target_addr = (ElfW(Addr) *)(load_bias + reloc_offset);
         *target_addr += load_bias;
 
-        base_offset = reloc_offset + word_size;
+        base_offset = reloc_offset + sizeof(ElfW(Addr));
 
         LOGD("RELR direct relocation at offset 0x%llx", (unsigned long long)reloc_offset);
 
@@ -1087,18 +1440,18 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
       for (size_t bit = 0; bitmap != 0 && bit < bits_per_entry - 1; bit++, bitmap >>= 1) {
         if ((bitmap & 1) == 0) continue;
 
-        ElfW(Addr) *target_addr = (ElfW(Addr) *)(load_bias + base_offset + (bit * word_size));
+        ElfW(Addr) *target_addr = (ElfW(Addr) *)(load_bias + base_offset + (bit * sizeof(ElfW(Addr))));
         *target_addr += load_bias;
 
-        LOGD("RELR bitmap relocation at offset 0x%llx", (unsigned long long)(base_offset + bit * word_size));
+        LOGD("RELR bitmap relocation at offset 0x%llx", (unsigned long long)(base_offset + bit * sizeof(ElfW(Addr))));
       }
 
-      base_offset += word_size * (bits_per_entry - 1);
+      base_offset += sizeof(ElfW(Addr)) * (bits_per_entry - 1);
     }
   }
 
   if (rela) {
-    LOGD("Processing RELA relocations for %s", image->elf);
+    LOGD("Processing RELA relocations for %s", dep->img->elf);
 
     if (rela_ent == 0) rela_ent = sizeof(ElfW(Rela));
 
@@ -1112,12 +1465,12 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
         .r_addend = r->r_addend
       };
 
-      _linker_process_unified_relocation(linker, image, &unified_r, load_bias, dynsym, dynstr, true);
+      _linker_process_unified_relocation(linker, dep, &unified_r, load_bias, dynsym, dynstr, true);
     }
   }
 
   if (rel) {
-    LOGD("Processing REL relocations for %s", image->elf);
+    LOGD("Processing REL relocations for %s", dep->img->elf);
 
     if (rel_ent == 0) rel_ent = sizeof(ElfW(Rel));
 
@@ -1131,16 +1484,16 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
         .r_addend = 0
       };
 
-      _linker_process_unified_relocation(linker, image, &unified_r, load_bias, dynsym, dynstr, false);
+      _linker_process_unified_relocation(linker, dep, &unified_r, load_bias, dynsym, dynstr, false);
     }
   }
 
   #ifdef __ANDROID__
     if (android_reloc) {
-      LOGD("Processing Android %s relocations for %s", is_rela ? "RELA" : "REL", image->elf);
+      LOGD("Processing Android %s relocations for %s", is_rela ? "RELA" : "REL", dep->img->elf);
 
       if (memcmp(android_reloc, "APS2", 4) != 0) {
-        LOGE("Invalid Android %s magic in %s", is_rela ? "RELA" : "REL", image->elf);
+        LOGE("Invalid Android %s magic in %s", is_rela ? "RELA" : "REL", dep->img->elf);
 
         return;
       }
@@ -1216,7 +1569,7 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
           if (is_rela && group_flags_reloc == RELOCATION_GROUP_HAS_ADDEND_FLAG)
             unified_r.r_addend += sleb128_decode(&decoder);
 
-          _linker_process_unified_relocation(linker, image, &unified_r, load_bias, dynsym, dynstr, is_rela);
+          _linker_process_unified_relocation(linker, dep, &unified_r, load_bias, dynsym, dynstr, is_rela);
         }
 
         i += group_size;
@@ -1232,11 +1585,11 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
        - relocate_linker by AOSP's linker
   */
   if (jmprel) {
-    LOGD("Processing %s PLT relocations for %s", pltrel_type == DT_RELA ? "RELA" : "REL", image->elf);
+    LOGD("Processing %s PLT relocations for %s", pltrel_type == DT_RELA ? "RELA" : "REL", dep->img->elf);
 
     if (pltrel_type == DT_RELA) {
       for (ElfW(Rela) *r = jmprel; (void *)r < (void *)jmprel + jmprel_sz; r++) {
-        LOGD("Processing PLT relocation of type %llu for %s", (unsigned long long)ELF_R_TYPE(r->r_info), image->elf);
+        LOGD("Processing PLT relocation of type %llu for %s", (unsigned long long)ELF_R_TYPE(r->r_info), dep->img->elf);
 
         struct _linker_unified_r unified_r = {
           .sym_idx = ELF_R_SYM(r->r_info),
@@ -1245,11 +1598,11 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
           .r_addend = pltrel_type == DT_RELA ? r->r_addend : 0
         };
 
-        _linker_process_unified_relocation(linker, image, &unified_r, load_bias, dynsym, dynstr, true);
+        _linker_process_unified_relocation(linker, dep, &unified_r, load_bias, dynsym, dynstr, true);
       }
     } else {
       for (ElfW(Rel) *r = jmprel; (void *)r < (void *)jmprel + jmprel_sz; r++) {
-        LOGD("Processing PLT relocation of type %llu for %s", (unsigned long long)ELF_R_TYPE(r->r_info), image->elf);
+        LOGD("Processing PLT relocation of type %llu for %s", (unsigned long long)ELF_R_TYPE(r->r_info), dep->img->elf);
 
         struct _linker_unified_r unified_r = {
           .sym_idx = ELF_R_SYM(r->r_info),
@@ -1258,7 +1611,7 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
           .r_addend = 0
         };
 
-        _linker_process_unified_relocation(linker, image, &unified_r, load_bias, dynsym, dynstr, false);
+        _linker_process_unified_relocation(linker, dep, &unified_r, load_bias, dynsym, dynstr, false);
       }
     }
   }
@@ -1365,25 +1718,11 @@ bool linker_link(struct linker *linker) {
     ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)linker->img->header + linker->img->header->e_phoff);
     ElfW(Dyn) *dyn = NULL;
     for (int i = 0; i < linker->img->header->e_phnum; i++) {
-      if (phdr[i].p_type == PT_DYNAMIC) {
-        dyn = (ElfW(Dyn) *)((uintptr_t)linker->img->base + phdr[i].p_vaddr - linker->img->bias);
-      }
+      if (phdr[i].p_type != PT_DYNAMIC) continue;
 
-      // if (phdr[i].p_type == PT_GNU_RELRO) {
-      //   if (relro_count >= MAX_RELRO) {
-      //     LOGE("Reached maximum number of RELRO regions");
-
-      //     carray_destroy(loaded_libs);
-
-      //     return false;
-      //   }
-
-      //   relro_regions[relro_count].addr = (void *)((uintptr_t)linker->img->base + phdr[i].p_vaddr - linker->img->bias);
-      //   relro_regions[relro_count].size = phdr[i].p_memsz;
-      //   relro_count++;
-
-      //   LOGD("Found RELRO segment in main image: %s", linker->img->elf);
-      // }
+      dyn = (ElfW(Dyn) *)((uintptr_t)linker->img->base + phdr[i].p_vaddr - linker->img->bias);
+      
+      break;
     }
 
     if (dyn) for (ElfW(Dyn) *d = dyn; d->d_tag != DT_NULL; ++d) {
@@ -1424,6 +1763,14 @@ bool linker_link(struct linker *linker) {
       LOGD("Library already loaded: %s", lib_full_path);
 
       continue;
+    }
+
+    if (linker->dep_count >= MAX_DEPS) {
+      LOGE("Maximum dependency count (%d) exceeded while loading: %s", MAX_DEPS, lib_full_path);
+
+      carray_destroy(loaded_libs);
+
+      return false;
     }
 
     struct loaded_dep *current_dep = &linker->dependencies[linker->dep_count];
@@ -1476,25 +1823,11 @@ bool linker_link(struct linker *linker) {
       ElfW(Dyn) *dep_dyn = NULL;
 
       for (int i = 0; i < current_dep->img->header->e_phnum; i++) {
-        if (dep_phdr[i].p_type == PT_DYNAMIC) {
-          dep_dyn = (ElfW(Dyn) *)((uintptr_t)current_dep->img->base + dep_phdr[i].p_vaddr - current_dep->img->bias);
-        }
+        if (dep_phdr[i].p_type != PT_DYNAMIC) continue;
 
-      //   if (dep_phdr[i].p_type == PT_GNU_RELRO) {
-      //     if (relro_count >= MAX_RELRO) {
-      //       LOGE("Reached maximum number of RELRO regions");
-
-      //       carray_destroy(loaded_libs);
-
-      //       return false;
-      //     }
-
-      //     relro_regions[relro_count].addr = (void *)((uintptr_t)current_dep->img->base + dep_phdr[i].p_vaddr - current_dep->img->bias);
-      //     relro_regions[relro_count].size = dep_phdr[i].p_memsz;
-      //     relro_count++;
-
-      //     LOGD("Found RELRO segment in dependency: %s", current_dep->img->elf);
-      //   }
+        dep_dyn = (ElfW(Dyn) *)((uintptr_t)current_dep->img->base + dep_phdr[i].p_vaddr - current_dep->img->bias);
+        
+        break;
       }
 
       if (dep_dyn) for (ElfW(Dyn) *d = dep_dyn; d->d_tag != DT_NULL; ++d) {
@@ -1562,24 +1895,14 @@ bool linker_link(struct linker *linker) {
   }
 
   LOGD("Processing relocations for main library and dependencies.");
-  _linker_process_relocations(linker, linker->img);
+  _linker_process_relocations(linker, (struct loaded_dep *)linker);
 
   for (int i = 0; i < linker->dep_count; i++) {
     if (!linker->dependencies[i].is_manual_load) continue;
 
     LOGD("Processing relocations for manually loaded dependency: %s", linker->dependencies[i].img->elf);
-    _linker_process_relocations(linker, linker->dependencies[i].img);
+    _linker_process_relocations(linker, &linker->dependencies[i]);
   }
-
-  // Protect RELRO regions
-  // for (size_t i = 0; i < relro_count; i++) {
-  //   struct relro_region *region = &relro_regions[i];
-  //   if (mprotect(region->addr, region->size, PROT_READ) != 0) {
-  //     LOGW("Failed to mprotect RELRO region at %p with size %zu: %s", region->addr, region->size, strerror(errno));
-  //   } else {
-  //     LOGD("Protected RELRO region at %p with size %zu", region->addr, region->size);
-  //   }
-  // }
 
   LOGD("Restoring memory protections after relocations");
   _linker_restore_protections(linker->img);
@@ -1589,6 +1912,19 @@ bool linker_link(struct linker *linker) {
     if (!dep->is_manual_load) continue;
 
     _linker_restore_protections(dep->img);
+  }
+
+  LOGD("Applying GNU RELRO protection for main library and dependencies.");
+  if (_linker_protect_gnu_relro(linker->img) != 0) {
+    LOGW("Failed to apply GNU RELRO protection to main library");
+  }
+
+  for (int i = 0; i < linker->dep_count; i++) {
+    if (!linker->dependencies[i].is_manual_load) continue;
+
+    if (_linker_protect_gnu_relro(linker->dependencies[i].img) != 0) {
+      LOGW("Failed to apply GNU RELRO protection to %s", linker->dependencies[i].img->elf);
+    }
   }
 
   if (!register_custom_library_for_backtrace(linker->img))
