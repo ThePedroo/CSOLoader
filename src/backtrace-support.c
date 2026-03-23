@@ -158,17 +158,26 @@ static uintptr_t decode_eh_value(uint8_t enc, const uint8_t **p, uintptr_t base,
       break;
     }
     case DW_EH_PE_sdata2: {
-      if (read_u16(p, end, (uint16_t *)&value) != 0) return 0;
+      uint16_t raw = 0;
+      if (read_u16(p, end, &raw) != 0) return 0;
+
+      value = (uintptr_t)(intptr_t)(int16_t)raw;
 
       break;
     }
     case DW_EH_PE_sdata4: {
-      if (read_u32(p, end, (uint32_t *)&value) != 0) return 0;
+      uint32_t raw = 0;
+      if (read_u32(p, end, &raw) != 0) return 0;
+
+      value = (uintptr_t)(intptr_t)(int32_t)raw;
 
       break;
     }
     case DW_EH_PE_sdata8: {
-      if (read_u64(p, end, (uint64_t *)&value) != 0) return 0;
+      uint64_t raw = 0;
+      if (read_u64(p, end, &raw) != 0) return 0;
+
+      value = (uintptr_t)(intptr_t)(int64_t)raw;
 
       break;
     }
