@@ -135,6 +135,7 @@ bool carray_remove(struct carray *carr, const char *str) {
       carr->array[i] = NULL;
 
       memmove(&carr->array[i], &carr->array[i + 1], (carr->size - i - 1) * sizeof(char *));
+      carr->array[carr->size - 1] = NULL;
 
       carr->length--;
 
