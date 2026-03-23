@@ -456,11 +456,13 @@ struct csoloader_elf *csoloader_elf_create(const char *elf, void *base) {
   bool bias_calculated = false;
   if (img->header->e_phoff > 0 && img->header->e_phnum > 0) {
     ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
-    ElfW(Dyn) *dyn = NULL;
+    ElfW(Addr) dynamic_vaddr = 0;
+    bool dynamic_found = false;
 
     for (int i = 0; i < img->header->e_phnum; ++i) {
       if (phdr[i].p_type == PT_DYNAMIC) {
-        dyn = (ElfW(Dyn) *)((uintptr_t)img->base + phdr[i].p_vaddr - img->bias);
+        dynamic_vaddr = phdr[i].p_vaddr;
+        dynamic_found = true;
 
         // LOGD("Located PT_DYNAMIC segment at virtual address: 0x%llu", (unsigned long long)phdr[i].p_vaddr);
       }
@@ -478,6 +480,21 @@ struct csoloader_elf *csoloader_elf_create(const char *elf, void *base) {
         // LOGD("Calculated bias %ld from PT_LOAD segment %d (vaddr %lx)", (long)img->bias, i, (unsigned long)phdr[i].p_vaddr);
       }
     }
+
+    if (!bias_calculated) for (int i = 0; i < img->header->e_phnum; ++i) {
+      if (phdr[i].p_type != PT_LOAD) continue;
+
+      img->bias = phdr[i].p_vaddr - phdr[i].p_offset;
+      bias_calculated = true;
+
+      // LOGD("Calculated bias %ld from first PT_LOAD segment %d (vaddr %lx, offset %lx)", (long)img->bias, i, (unsigned long)phdr[i].p_vaddr, (unsigned long)phdr[i].p_offset);
+
+      break;
+    }
+
+    ElfW(Dyn) *dyn = NULL;
+    if (dynamic_found)
+      dyn = (ElfW(Dyn) *)((uintptr_t)img->base + dynamic_vaddr - img->bias);
 
     if (dyn) for (ElfW(Dyn) *d = dyn; d->d_tag != DT_NULL; ++d) {
       uintptr_t ptr_val = (uintptr_t)img->base + d->d_un.d_ptr - img->bias;
@@ -539,18 +556,6 @@ struct csoloader_elf *csoloader_elf_create(const char *elf, void *base) {
           break;
         }
       }
-    }
-
-    if (!bias_calculated) for (int i = 0; i < img->header->e_phnum; ++i) {
-      if (phdr[i].p_type != PT_LOAD) continue;
-
-      img->bias = phdr[i].p_vaddr - phdr[i].p_offset;
-      bias_calculated = true;
-
-      // LOGD("Calculated bias %ld from first PT_LOAD segment %d (vaddr %lx, offset %lx)",
-      //     (long)img->bias, i, (unsigned long)phdr[i].p_vaddr, (unsigned long)phdr[i].p_offset);
-
-      break;
     }
 
     /* INFO: Populate EH regions from Program Headers when possible */
