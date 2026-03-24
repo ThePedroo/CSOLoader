@@ -386,14 +386,14 @@ static bool _linker_find_library_path(struct linker *linker, const char *lib_nam
 
 static struct csoloader_elf *_linker_find_loaded_image(struct linker *linker, const char *name) {
   const char *base_name = _path_basename(name);
-  if (linker->img && (strcmp(linker->img->elf, name) == 0) || (strcmp(_path_basename(linker->img->elf), base_name) == 0))
+  if (linker->img && (strcmp(linker->img->elf, name) == 0 || strcmp(_path_basename(linker->img->elf), base_name) == 0))
     return linker->img;
 
   for (int i = 0; i < linker->dep_count; i++) {
     struct loaded_dep *dep = &linker->dependencies[i];
     if (!dep->img || !dep->is_manual_load) continue;
 
-    if ((strcmp(dep->img->elf, name) == 0) || (strcmp(_path_basename(dep->img->elf), base_name) == 0))
+    if (strcmp(dep->img->elf, name) == 0 || strcmp(_path_basename(dep->img->elf), base_name) == 0)
       return dep->img;
   }
 
