@@ -384,86 +384,88 @@ static bool _linker_find_library_path(struct linker *linker, const char *lib_nam
   return false;
 }
 
-static struct csoloader_elf *_linker_find_loaded_image(struct linker *linker, const char *name) {
-  const char *base_name = _path_basename(name);
-  if (linker->img && (strcmp(linker->img->elf, name) == 0 || strcmp(_path_basename(linker->img->elf), base_name) == 0))
-    return linker->img;
+#ifdef CSOLOADER_MAKE_LINKER_HOOKS
+  static struct csoloader_elf *_linker_find_loaded_image(struct linker *linker, const char *name) {
+    const char *base_name = _path_basename(name);
+    if (linker->img && (strcmp(linker->img->elf, name) == 0 || strcmp(_path_basename(linker->img->elf), base_name) == 0))
+      return linker->img;
 
-  for (int i = 0; i < linker->dep_count; i++) {
-    struct loaded_dep *dep = &linker->dependencies[i];
-    if (!dep->img || !dep->is_manual_load) continue;
+    for (int i = 0; i < linker->dep_count; i++) {
+      struct loaded_dep *dep = &linker->dependencies[i];
+      if (!dep->img || !dep->is_manual_load) continue;
 
-    if (strcmp(dep->img->elf, name) == 0 || strcmp(_path_basename(dep->img->elf), base_name) == 0)
-      return dep->img;
+      if (strcmp(dep->img->elf, name) == 0 || strcmp(_path_basename(dep->img->elf), base_name) == 0)
+        return dep->img;
+    }
+
+    return NULL;
   }
 
-  return NULL;
-}
+  static struct csoloader_elf *_linker_image_from_handle(struct linker *linker, void *handle) {
+    if (!linker || !handle || handle == RTLD_DEFAULT || handle == RTLD_NEXT) return NULL;
+    if (handle == linker->img) return linker->img;
 
-static struct csoloader_elf *_linker_image_from_handle(struct linker *linker, void *handle) {
-  if (!linker || !handle || handle == RTLD_DEFAULT || handle == RTLD_NEXT) return NULL;
-  if (handle == linker->img) return linker->img;
+    for (int i = 0; i < linker->dep_count; i++) {
+      if (!linker->dependencies[i].is_manual_load || handle != linker->dependencies[i].img) continue;
 
-  for (int i = 0; i < linker->dep_count; i++) {
-    if (!linker->dependencies[i].is_manual_load || handle != linker->dependencies[i].img) continue;
+      return linker->dependencies[i].img;
+    }
 
-    return linker->dependencies[i].img;
+    return NULL;
   }
 
-  return NULL;
-}
+  static void *_linker_get_original_libdl_symbol(const char *name) {
+    struct csoloader_elf *libdl_elf = csoloader_elf_create("libdl.so", NULL);
+    if (!libdl_elf) return NULL;
 
-static void *_linker_get_original_libdl_symbol(const char *name) {
-  struct csoloader_elf *libdl_elf = csoloader_elf_create("libdl.so", NULL);
-  if (!libdl_elf) return NULL;
-
-  void *sym = (void *)csoloader_elf_symb_address(libdl_elf, name);
-  csoloader_elf_destroy(libdl_elf);
-
-  return sym;
-}
-
-static void *custom_dlopen(const char *filename, int flags) {
-  void *(*original_dlopen)(const char *, int) = (void *(*)(const char *, int))_linker_get_original_libdl_symbol("dlopen");
-  if (!filename) return original_dlopen ? original_dlopen(filename, flags) : NULL;
-
-  struct linker *linker = _linker_find_by_caller_address(__builtin_return_address(0));
-  if (linker) {
-    struct csoloader_elf *img = _linker_find_loaded_image(linker, filename);    
-    if (img) return img;
-  }
-
-  return original_dlopen ? original_dlopen(filename, flags) : NULL;
-}
-
-/* INFO: If a handle is shared between modules, this will not be able to find it.*/
-static void *custom_dlsym(void *handle, const char *symbol) {
-  void *(*original_dlsym)(void *, const char *) = (void *(*)(void *, const char *))_linker_get_original_libdl_symbol("dlsym");
-
-  struct linker *linker = _linker_find_by_caller_address(__builtin_return_address(0));
-  struct csoloader_elf *img = _linker_image_from_handle(linker, handle);
-  if (img) {
-    if (!symbol) return NULL;
-
-    void *sym = (void *)csoloader_elf_symb_address_exported(img, symbol);
-    if (!sym)
-      sym = (void *)csoloader_elf_symb_address(img, symbol);
+    void *sym = (void *)csoloader_elf_symb_address(libdl_elf, name);
+    csoloader_elf_destroy(libdl_elf);
 
     return sym;
   }
 
-  return original_dlsym ? original_dlsym(handle, symbol) : NULL;
-}
+  static void *custom_dlopen(const char *filename, int flags) {
+    void *(*original_dlopen)(const char *, int) = (void *(*)(const char *, int))_linker_get_original_libdl_symbol("dlopen");
+    if (!filename) return original_dlopen ? original_dlopen(filename, flags) : NULL;
 
-/* INFO: If a handle is shared between modules, this will not be able to find it.*/
-static int custom_dlclose(void *handle) {
-  int (*original_dlclose)(void *) = (int (*)(void *))_linker_get_original_libdl_symbol("dlclose");
+    struct linker *linker = _linker_find_by_caller_address(__builtin_return_address(0));
+    if (linker) {
+      struct csoloader_elf *img = _linker_find_loaded_image(linker, filename);    
+      if (img) return img;
+    }
 
-  struct linker *linker = _linker_find_by_caller_address(__builtin_return_address(0));
-  if (linker && _linker_image_from_handle(linker, handle)) return 0;
+    return original_dlopen ? original_dlopen(filename, flags) : NULL;
+  }
 
-  return original_dlclose ? original_dlclose(handle) : -1;
-}
+  /* INFO: If a handle is shared between modules, this will not be able to find it.*/
+  static void *custom_dlsym(void *handle, const char *symbol) {
+    void *(*original_dlsym)(void *, const char *) = (void *(*)(void *, const char *))_linker_get_original_libdl_symbol("dlsym");
+
+    struct linker *linker = _linker_find_by_caller_address(__builtin_return_address(0));
+    struct csoloader_elf *img = _linker_image_from_handle(linker, handle);
+    if (img) {
+      if (!symbol) return NULL;
+
+      void *sym = (void *)csoloader_elf_symb_address_exported(img, symbol);
+      if (!sym)
+        sym = (void *)csoloader_elf_symb_address(img, symbol);
+
+      return sym;
+    }
+
+    return original_dlsym ? original_dlsym(handle, symbol) : NULL;
+  }
+
+  /* INFO: If a handle is shared between modules, this will not be able to find it.*/
+  static int custom_dlclose(void *handle) {
+    int (*original_dlclose)(void *) = (int (*)(void *))_linker_get_original_libdl_symbol("dlclose");
+
+    struct linker *linker = _linker_find_by_caller_address(__builtin_return_address(0));
+    if (linker && _linker_image_from_handle(linker, handle)) return 0;
+
+    return original_dlclose ? original_dlclose(handle) : -1;
+  }
+#endif /* CSOLOADER_MAKE_LINKER_HOOKS */
 
 /* INFO: Internal functions END */
 
@@ -1380,46 +1382,56 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
         return false;
       }
 
-      if (strcmp(sym_name, "dl_iterate_phdr") == 0) {
-        LOGD("Special case for dl_iterate_phdr: using custom implementation");
+      /* INFO: If CSOLoader is unloaded, or for whatever reason, isn't in the same memory location, and a
+                 library loaded by it calls any of those functions (with the macro defined), it will try
+                 to call an address that is no longer valid, resulting in an undefined behavior, which
+                 most of the time, in most devices, will result in a segmentation fault. */
+      #ifdef CSOLOADER_MAKE_LINKER_HOOKS
+        if (strcmp(sym_name, "dl_iterate_phdr") == 0) {
+          LOGD("Special case for dl_iterate_phdr: using custom implementation");
 
-        *target_addr = (ElfW(Addr))custom_dl_iterate_phdr;
+          *target_addr = (ElfW(Addr))custom_dl_iterate_phdr;
 
-        return true;
-      }
+          return true;
+        }
 
-      if (strcmp(sym_name, "dladdr") == 0) {
-        LOGD("Special case for dladdr: using custom implementation");
+        if (strcmp(sym_name, "dladdr") == 0) {
+          LOGD("Special case for dladdr: using custom implementation");
 
-        *target_addr = (ElfW(Addr))custom_dladdr;
+          *target_addr = (ElfW(Addr))custom_dladdr;
 
-        return true;
-      }
+          return true;
+        }
 
-      if (strcmp(sym_name, "dlopen") == 0) {
-        LOGD("Special case for dlopen: using custom implementation");
+        if (strcmp(sym_name, "dlopen") == 0) {
+          LOGD("Special case for dlopen: using custom implementation");
 
-        *target_addr = (ElfW(Addr))custom_dlopen;
+          *target_addr = (ElfW(Addr))custom_dlopen;
 
-        return true;
-      }
+          return true;
+        }
 
-      if (strcmp(sym_name, "dlsym") == 0) {
-        LOGD("Special case for dlsym: using custom implementation");
+        if (strcmp(sym_name, "dlsym") == 0) {
+          LOGD("Special case for dlsym: using custom implementation");
 
-        *target_addr = (ElfW(Addr))custom_dlsym;
+          *target_addr = (ElfW(Addr))custom_dlsym;
 
-        return true;
-      }
+          return true;
+        }
 
-      if (strcmp(sym_name, "dlclose") == 0) {
-        LOGD("Special case for dlclose: using custom implementation");
+        if (strcmp(sym_name, "dlclose") == 0) {
+          LOGD("Special case for dlclose: using custom implementation");
 
-        *target_addr = (ElfW(Addr))custom_dlclose;
+          *target_addr = (ElfW(Addr))custom_dlclose;
 
-        return true;
-      }
+          return true;
+        }
+      #endif /* CSOLOADER_MAKE_LINKER_HOOKS */
 
+      /* INFO: While the comment for other hooks is still valid for this one, it is a critical
+                 component of the TLS system from CSOLoader, and if not hooked, will also result
+                 in improper TLS handling. So, because of that, it will always be hooked,
+                 regardless of the CSOLOADER_MAKE_LINKER_HOOKS macro. */
       if (strcmp(sym_name, "__tls_get_addr") == 0) {
         LOGD("Special case for __tls_get_addr: using custom TLS implementation");
 
