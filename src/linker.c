@@ -1214,17 +1214,7 @@ struct _linker_unified_r {
   ElfW(Addr) r_addend;
 };
 
-#ifdef __aarch64__
-  ElfW(Addr) dynamic_tls_resolver_impl(ElfW(Addr) *desc);
-  ElfW(Addr) tlsdesc_resolver_unresolved_weak_impl(ElfW(Addr) *desc);
-  ElfW(Addr) dynamic_tls_resolver(ElfW(Addr) *desc);
-  ElfW(Addr) tlsdesc_resolver_unresolved_weak(ElfW(Addr) *desc);
-#else
-  #define dynamic_tls_resolver dynamic_tls_resolver_impl
-  #define tlsdesc_resolver_unresolved_weak tlsdesc_resolver_unresolved_weak_impl
-#endif
-
-ElfW(Addr) dynamic_tls_resolver_impl(ElfW(Addr) *desc) {
+static ElfW(Addr) dynamic_tls_resolver(ElfW(Addr) *desc) {
   /* INFO: desc[0] = resolver (this function), desc[1] = our tls_index pointer */
   struct tls_index *ti = (struct tls_index *)desc[1];
 
@@ -1244,7 +1234,7 @@ ElfW(Addr) dynamic_tls_resolver_impl(ElfW(Addr) *desc) {
   return result;
 }
 
-ElfW(Addr) tlsdesc_resolver_unresolved_weak_impl(ElfW(Addr) *desc) {
+static ElfW(Addr) tlsdesc_resolver_unresolved_weak(ElfW(Addr) *desc) {
   ElfW(Addr) addend = desc[1];
   ElfW(Addr) tpidr = _linker_get_tpidr();
   ElfW(Addr) result = addend - tpidr;
@@ -1253,74 +1243,6 @@ ElfW(Addr) tlsdesc_resolver_unresolved_weak_impl(ElfW(Addr) *desc) {
 
   return result;
 }
-
-#ifdef __aarch64__
-  __asm__(
-    ".text\n"
-    ".global dynamic_tls_resolver\n"
-    ".type dynamic_tls_resolver, %function\n"
-    "dynamic_tls_resolver:\n"
-    "  sub sp, sp, #0xb0\n"
-    "  stp x1, x2, [sp, #0]\n"
-    "  stp x3, x4, [sp, #16]\n"
-    "  stp x5, x6, [sp, #32]\n"
-    "  stp x7, x8, [sp, #48]\n"
-    "  stp x9, x10, [sp, #64]\n"
-    "  stp x11, x12, [sp, #80]\n"
-    "  stp x13, x14, [sp, #96]\n"
-    "  stp x15, x16, [sp, #112]\n"
-    "  stp x17, x18, [sp, #128]\n"
-    "  stp x29, x30, [sp, #144]\n"
-    "  mrs x16, nzcv\n"
-    "  str x16, [sp, #160]\n"
-    "  bl dynamic_tls_resolver_impl\n"
-    "  ldr x16, [sp, #160]\n"
-    "  msr nzcv, x16\n"
-    "  ldp x1, x2, [sp, #0]\n"
-    "  ldp x3, x4, [sp, #16]\n"
-    "  ldp x5, x6, [sp, #32]\n"
-    "  ldp x7, x8, [sp, #48]\n"
-    "  ldp x9, x10, [sp, #64]\n"
-    "  ldp x11, x12, [sp, #80]\n"
-    "  ldp x13, x14, [sp, #96]\n"
-    "  ldp x15, x16, [sp, #112]\n"
-    "  ldp x17, x18, [sp, #128]\n"
-    "  ldp x29, x30, [sp, #144]\n"
-    "  add sp, sp, #0xb0\n"
-    "  ret\n"
-    ".global tlsdesc_resolver_unresolved_weak\n"
-    ".type tlsdesc_resolver_unresolved_weak, %function\n"
-    "tlsdesc_resolver_unresolved_weak:\n"
-    "  sub sp, sp, #0xb0\n"
-    "  stp x1, x2, [sp, #0]\n"
-    "  stp x3, x4, [sp, #16]\n"
-    "  stp x5, x6, [sp, #32]\n"
-    "  stp x7, x8, [sp, #48]\n"
-    "  stp x9, x10, [sp, #64]\n"
-    "  stp x11, x12, [sp, #80]\n"
-    "  stp x13, x14, [sp, #96]\n"
-    "  stp x15, x16, [sp, #112]\n"
-    "  stp x17, x18, [sp, #128]\n"
-    "  stp x29, x30, [sp, #144]\n"
-    "  mrs x16, nzcv\n"
-    "  str x16, [sp, #160]\n"
-    "  bl tlsdesc_resolver_unresolved_weak_impl\n"
-    "  ldr x16, [sp, #160]\n"
-    "  msr nzcv, x16\n"
-    "  ldp x1, x2, [sp, #0]\n"
-    "  ldp x3, x4, [sp, #16]\n"
-    "  ldp x5, x6, [sp, #32]\n"
-    "  ldp x7, x8, [sp, #48]\n"
-    "  ldp x9, x10, [sp, #64]\n"
-    "  ldp x11, x12, [sp, #80]\n"
-    "  ldp x13, x14, [sp, #96]\n"
-    "  ldp x15, x16, [sp, #112]\n"
-    "  ldp x17, x18, [sp, #128]\n"
-    "  ldp x29, x30, [sp, #144]\n"
-    "  add sp, sp, #0xb0\n"
-    "  ret\n"
-  );
-#endif
 
 static bool _linker_process_unified_relocation(struct linker *linker, struct loaded_dep *dep, struct _linker_unified_r *r, ElfW(Addr) load_bias, ElfW(Sym) *dynsym, char *dynstr, bool is_rela) {
   ElfW(Addr) *target_addr = (ElfW(Addr) *)(load_bias + r->r_offset);
