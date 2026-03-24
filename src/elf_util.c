@@ -39,6 +39,10 @@
   #endif
 #endif
 
+#ifndef ELF_ST_VISIBILITY
+  #define ELF_ST_VISIBILITY(o) ((o) & 0x3)
+#endif
+
 static uint32_t elf_hash(const char *name) {
   uint32_t h = 0, g = 0;
 
@@ -698,7 +702,23 @@ static bool load_symtabs(struct csoloader_elf *img) {
   return true;
 }
 
-static ElfW(Addr) gnu_symbol_lookup(struct csoloader_elf *restrict img, const char *name, uint32_t hash, unsigned char *sym_type) {
+static bool is_dynamic_symbol_visible(const ElfW(Sym) *sym, bool exported_only) {
+  if (!sym || sym->st_shndx == SHN_UNDEF) return false;
+  if (!exported_only) return true;
+
+  unsigned char bind = ELF_ST_BIND(sym->st_info);
+  unsigned char vis = ELF_ST_VISIBILITY(sym->st_other);
+
+  if (bind != STB_GLOBAL && bind != STB_WEAK
+    #ifdef STB_GNU_UNIQUE
+      && bind != STB_GNU_UNIQUE
+    #endif
+  ) return false;
+
+  return vis == STV_DEFAULT || vis == STV_PROTECTED;
+}
+
+static ElfW(Addr) gnu_symbol_lookup(struct csoloader_elf *restrict img, const char *name, uint32_t hash, unsigned char *sym_type, bool exported_only) {
   if (img->gnu_nbucket_ == 0 || img->gnu_bloom_size_ == 0 || !img->gnu_bloom_filter_ || !img->gnu_bucket_ || !img->gnu_chain_ || !img->dynsym_start || !img->strtab_start)
     return 0;
 
@@ -743,7 +763,7 @@ static ElfW(Addr) gnu_symbol_lookup(struct csoloader_elf *restrict img, const ch
     return 0;
   }
 
-  if ((((chain_val ^ hash) >> 1) == 0 && strcmp(name, strings + sym->st_name) == 0) && sym->st_shndx != SHN_UNDEF) {
+  if ((((chain_val ^ hash) >> 1) == 0 && strcmp(name, strings + sym->st_name) == 0) && is_dynamic_symbol_visible(sym, exported_only)) {
     unsigned int type = ELF_ST_TYPE(sym->st_info);
     if (sym_type) *sym_type = type;
 
@@ -768,7 +788,7 @@ static ElfW(Addr) gnu_symbol_lookup(struct csoloader_elf *restrict img, const ch
       break;
     }
 
-    if ((((chain_val ^ hash) >> 1) == 0 && strcmp(name, strings + sym->st_name) == 0) && sym->st_shndx != SHN_UNDEF) {
+    if ((((chain_val ^ hash) >> 1) == 0 && strcmp(name, strings + sym->st_name) == 0) && is_dynamic_symbol_visible(sym, exported_only)) {
       unsigned int type = ELF_ST_TYPE(sym->st_info);
       if (sym_type) *sym_type = type;
 
@@ -779,7 +799,7 @@ static ElfW(Addr) gnu_symbol_lookup(struct csoloader_elf *restrict img, const ch
   return 0;
 }
 
-static ElfW(Addr) elf_symbol_lookup(struct csoloader_elf *restrict img, const char *restrict name, uint32_t hash, unsigned char *sym_type) {
+static ElfW(Addr) elf_symbol_lookup(struct csoloader_elf *restrict img, const char *restrict name, uint32_t hash, unsigned char *sym_type, bool exported_only) {
   if (img->nbucket_ == 0 || !img->bucket_ || !img->chain_ || !img->dynsym_start || !img->strtab_start)
     return 0;
 
@@ -788,7 +808,7 @@ static ElfW(Addr) elf_symbol_lookup(struct csoloader_elf *restrict img, const ch
   for (size_t n = img->bucket_[hash % img->nbucket_]; n != STN_UNDEF; n = img->chain_[n]) {
     ElfW(Sym) *sym = img->dynsym_start + n;
 
-    if (strcmp(name, strings + sym->st_name) == 0 && sym->st_shndx != SHN_UNDEF) {
+    if (strcmp(name, strings + sym->st_name) == 0 && is_dynamic_symbol_visible(sym, exported_only)) {
       unsigned int type = ELF_ST_TYPE(sym->st_info);
       if (sym_type) *sym_type = type;
 
@@ -868,16 +888,34 @@ static ElfW(Addr) linear_symbol_lookupByPrefix(struct csoloader_elf *img, const 
 ElfW(Addr) csoloader_elf_symb_offset(struct csoloader_elf *img, const char *name, unsigned char *sym_type) {
   ElfW(Addr) offset = 0;
 
-  offset = gnu_symbol_lookup(img, name, gnu_hash(name), sym_type);
+  offset = gnu_symbol_lookup(img, name, gnu_hash(name), sym_type, false);
   if (offset != 0) return offset;
 
-  offset = elf_symbol_lookup(img, name, elf_hash(name), sym_type);
+  offset = elf_symbol_lookup(img, name, elf_hash(name), sym_type, false);
   if (offset != 0) return offset;
 
-  offset = linear_symbol_lookup(img, name, sym_type);
-  if (offset != 0) return offset;
+  /* INFO: Do not fall back to .symtab for dynamic linker resolution.
+             We only resolve against dynamic export tables. */
 
   return 0;
+}
+
+static ElfW(Addr) handle_indirect_symbol(struct csoloader_elf *img, ElfW(Off) offset);
+
+ElfW(Addr) csoloader_elf_symb_address_exported(struct csoloader_elf *img, const char *name) {
+  unsigned char sym_type = 0;
+  ElfW(Addr) offset = 0;
+
+  offset = gnu_symbol_lookup(img, name, gnu_hash(name), &sym_type, true);
+  if (offset == 0)
+    offset = elf_symbol_lookup(img, name, elf_hash(name), &sym_type, true);
+
+  if (offset == 0 || !img->base) return 0;
+
+  if (sym_type == STT_GNU_IFUNC)
+    return handle_indirect_symbol(img, offset);
+
+  return (ElfW(Addr))((uintptr_t)img->base + offset - img->bias);
 }
 
 #ifdef __aarch64__

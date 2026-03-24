@@ -103,6 +103,8 @@ ElfW(Addr) csoloader_elf_symb_offset(struct csoloader_elf *img, const char *name
 
 ElfW(Addr) csoloader_elf_symb_address(struct csoloader_elf *img, const char *name);
 
+ElfW(Addr) csoloader_elf_symb_address_exported(struct csoloader_elf *img, const char *name);
+
 ElfW(Addr) csoloader_elf_symb_address_by_prefix(struct csoloader_elf *img, const char *prefix);
 
 void *csoloader_elf_symb_value_by_prefix(struct csoloader_elf *img, const char *prefix);

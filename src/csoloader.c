@@ -48,8 +48,7 @@ bool csoloader_load(struct csoloader *lib, const char *lib_path) {
     return false;
   }
 
-  struct linker linker;
-  if (!linker_init(&linker, elf_image)) {
+  if (!linker_init(&lib->linker, elf_image)) {
     LOGE("Failed to initialize linker for %s", lib_path);
 
     csoloader_elf_destroy(elf_image);
@@ -59,14 +58,12 @@ bool csoloader_load(struct csoloader *lib, const char *lib_path) {
     return false;
   }
 
-  linker.main_map_size = dep_info.map_size;
+  lib->linker.main_map_size = dep_info.map_size;
 
-  if (!linker_link(&linker)) {
+  if (!linker_link(&lib->linker)) {
     LOGE("Linker failed to link %s", lib_path);
 
-    csoloader_elf_destroy(elf_image);
-    if (dep_info.map_size > 0)
-      munmap(map_start, dep_info.map_size);
+    linker_destroy(&lib->linker);
 
     return false;
   }
@@ -76,16 +73,10 @@ bool csoloader_load(struct csoloader *lib, const char *lib_path) {
   if (!lib->lib_path) {
     LOGE("Failed to duplicate library path string");
 
-    linker_destroy(&linker);
-
-    csoloader_elf_destroy(elf_image);
-    if (dep_info.map_size > 0)
-      munmap(map_start, dep_info.map_size);
+    linker_destroy(&lib->linker);
 
     return false;
   }
-
-  lib->linker = linker;
 
   return true;
 }
