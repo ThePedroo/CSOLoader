@@ -819,37 +819,7 @@ static ElfW(Addr) elf_symbol_lookup(struct csoloader_elf *restrict img, const ch
   return 0;
 }
 
-static ElfW(Addr) linear_symbol_lookup(struct csoloader_elf *img, const char *restrict name, unsigned char *sym_type) {
-  if (!load_symtabs(img)) {
-    // LOGE("Failed to load symtabs for linear lookup of %s", name);
-
-    return 0;
-  }
-
-  size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
-  if (valid_symtabs_amount == 0) {
-    LOGW("No valid symbols (FUNC/OBJECT with size > 0) found in .symtab for %s", img->elf);
-
-    return 0;
-  }
-
-  for (size_t i = 0; i < valid_symtabs_amount; i++) {
-    if (!img->symtabs_[i].name || strcmp(name, img->symtabs_[i].name) != 0)
-      continue;
-
-    if (img->symtabs_[i].sym->st_shndx == SHN_UNDEF)
-      continue;
-
-    unsigned int type = ELF_ST_TYPE(img->symtabs_[i].sym->st_info);
-    if (sym_type) *sym_type = type;
-
-    return img->symtabs_[i].sym->st_value;
-  }
-
-  return 0;
-}
-
-static ElfW(Addr) linear_symbol_lookupByPrefix(struct csoloader_elf *img, const char *prefix, unsigned char *sym_type) {
+static ElfW(Addr) linear_symbol_lookup_by_prefix(struct csoloader_elf *img, const char *prefix, unsigned char *sym_type) {
   if (!load_symtabs(img)) {
     LOGE("Failed to load symtabs for linear lookup by prefix of %s", prefix);
 
@@ -994,7 +964,7 @@ ElfW(Addr) csoloader_elf_symb_address(struct csoloader_elf *img, const char *nam
 
 ElfW(Addr) csoloader_elf_symb_address_by_prefix(struct csoloader_elf *img, const char *prefix) {
   unsigned char sym_type = 0;
-  ElfW(Addr) offset = linear_symbol_lookupByPrefix(img, prefix, &sym_type);
+  ElfW(Addr) offset = linear_symbol_lookup_by_prefix(img, prefix, &sym_type);
 
   if (offset == 0 || !img->base) return 0;
 
@@ -1031,7 +1001,7 @@ struct sym_info csoloader_elf_get_symbol(struct csoloader_elf *img, uintptr_t ad
 
   for (size_t i = 0; i < valid_symtabs_amount; i++) {
     ElfW(Sym) *sym = img->symtabs_[i].sym;
-    if (sym->st_value == 0 || sym->st_size == 0) continue;
+    if (!sym || sym->st_value == 0 || sym->st_size == 0) continue;
 
     ElfW(Addr) sym_start = (ElfW(Addr))((uintptr_t)img->base + sym->st_value - img->bias);
     ElfW(Addr) sym_end = sym_start + sym->st_size;

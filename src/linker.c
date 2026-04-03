@@ -292,7 +292,6 @@ static bool _linker_call_manual_constructors(struct linker *linker, int index, u
 static int _linker_protect_gnu_relro(struct csoloader_elf *img) {
   ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
   ElfW(Addr) load_bias = (ElfW(Addr))img->base - img->bias;
-  int protected_count = 0;
 
   for (int i = 0; i < img->header->e_phnum; i++) {
     if (phdr[i].p_type != PT_GNU_RELRO) continue;
@@ -314,8 +313,6 @@ static int _linker_protect_gnu_relro(struct csoloader_elf *img) {
     }
 
     LOGD("Protected GNU_RELRO region at %p (size %zu) in %s", (void *)seg_page_start, seg_size, img->elf);
-
-    protected_count++;
   }
 
   return 0;
@@ -334,7 +331,7 @@ static void _linker_internal_init() {
   LOGD("System page size: %zu bytes", system_page_size);
 }
 
-static bool _linker_find_library_path(struct linker *linker, const char *lib_name, char *full_path, size_t full_path_size) {
+static bool _linker_find_library_path(const char *lib_name, char *full_path, size_t full_path_size) {
   const char *search_paths[] = {
     #ifdef __LP64__
       #ifdef __ANDROID__
@@ -1522,13 +1519,11 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
          INFO: Since CSOLoader only handles dlopen'd libraries, we cannot support
                  true static TLS. However, we can emulate by computing offset from tpidr. */
       struct csoloader_elf *tls_img = NULL;
-      struct tls_indices_data *target_tls_indices = NULL;
       ElfW(Addr) tpoff = 0;
       
       if (r->sym_idx == 0) {
         /* INFO: If not referenced, assume current module */
         tls_img = dep->img;
-        target_tls_indices = &dep->tls_indices;
       } else {
         ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
         uint8_t bind = ELF_ST_BIND(sym_ent->st_info);        
@@ -1556,7 +1551,6 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
         }
 
         tls_img = sym.img;
-        target_tls_indices = sym.tls_indices;
       }
       
       if (!tls_img || !tls_img->tls_segment) {
@@ -2041,7 +2035,7 @@ bool linker_link(struct linker *linker) {
     }
 
     char lib_full_path[PATH_MAX];
-    if (!_linker_find_library_path(linker, lib_name, lib_full_path, sizeof(lib_full_path))) {
+    if (!_linker_find_library_path(lib_name, lib_full_path, sizeof(lib_full_path))) {
       LOGW("Could not find required library: %s", lib_name);
 
       /* INFO: Rather than failing, just skip missing libraries.
@@ -2068,15 +2062,12 @@ bool linker_link(struct linker *linker) {
 
     struct loaded_dep *current_dep = &linker->dependencies[linker->dep_count];
 
-    void *base_addr = NULL;
     struct csoloader_elf *check_img = csoloader_elf_create(lib_name, NULL);
     if (check_img && check_img->base) {
-      base_addr = check_img->base;
-
       current_dep->img = check_img;
       current_dep->is_manual_load = false;
     } else {
-      base_addr = linker_load_library_manually(lib_full_path, current_dep);
+      void *base_addr = linker_load_library_manually(lib_full_path, current_dep);
       if (!base_addr) {
         LOGE("Failed to manually load library: %s", lib_full_path);
 
