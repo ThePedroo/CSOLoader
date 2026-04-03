@@ -55,4 +55,6 @@ void linker_abandon(struct linker *linker);
 
 bool linker_link(struct linker *linker);
 
+void linker_deinit(void);
+
 #endif /* LINKER_H */

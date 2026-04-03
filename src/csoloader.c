@@ -106,6 +106,10 @@ void *csoloader_get_symbol(struct csoloader *lib, const char *symbol_name) {
   return (void *)csoloader_elf_symb_address(lib->img, symbol_name);
 }
 
+void csoloader_deinit(void) {
+  linker_deinit();
+}
+
 #ifdef STANDALONE_TEST
   int main(int argc, char **argv, char **envp) {
     g_argc = argc;

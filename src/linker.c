@@ -2273,3 +2273,19 @@ bool linker_link(struct linker *linker) {
 
   return true;
 }
+
+void linker_deinit(void) {
+  struct thread_tls *ttls = (struct thread_tls *)pthread_getspecific(g_tls_key);
+  if (ttls) _linker_destroy_thread_tls(ttls);
+  pthread_setspecific(g_tls_key, NULL);
+
+  pthread_key_delete(g_tls_key);
+  g_tls_key_initialized = false;
+  g_tls_key_once = PTHREAD_ONCE_INIT;
+
+  g_tls_generation = 0;
+  memset(&g_tls_modules, 0, sizeof(g_tls_modules));
+
+  pthread_mutex_destroy(&g_tls_mutex);
+  g_tls_mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+}

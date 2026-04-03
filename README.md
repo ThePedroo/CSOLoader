@@ -65,6 +65,9 @@ Frees all internal management handles while allowing it to still continue operat
 
 Gets the symbol address from the loaded library, won't work if the library has been abandoned. Returns NULL if operation failed.
 
+5. `void csoloader_deinit(void)`
+Deinitializes all internal global resources, such as TLS management. This is required to be called if you won't be using CSOLoader anymore, and want to leave no traces behind.
+
 > [!IMPORTANT]
 > You may also want to define `CSOLOADER_MAKE_LINKER_HOOKS` macro to make CSOLoader hook some functions that are commonly used by libraries, such as `dl_iterate_phdr`, `dlopen`, `dlclose`, and `dladdr`. However, doing so, will make so that CSOLoader must be kept loaded, since if CSOLoader is unloaded, it will call an unmapped address. However, even with it not defined, CSOLoader will still hook `__tls_get_addr` to provide TLS support, so it is better to not use TLS it if you want to use unload CSOLoader and have them work flawlessly.
 
