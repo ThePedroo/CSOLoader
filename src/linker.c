@@ -145,29 +145,31 @@ static void _linker_unregister(struct linker *linker) {
   }
 }
 
-static struct linker *_linker_find_by_caller_address(void *caller_addr) {
-  uintptr_t addr = (uintptr_t)caller_addr;
+#ifdef CSOLOADER_MAKE_LINKER_HOOKS
+  static struct linker *_linker_find_by_caller_address(void *caller_addr) {
+    uintptr_t addr = (uintptr_t)caller_addr;
 
-  for (int i = 0; i < g_active_linker_count; i++) {
-    struct linker *linker = g_active_linkers[i];
-    if (!linker || !linker->img) continue;
+    for (int i = 0; i < g_active_linker_count; i++) {
+      struct linker *linker = g_active_linkers[i];
+      if (!linker || !linker->img) continue;
 
-    uintptr_t main_base = (uintptr_t)linker->img->base;
-    if (addr >= main_base && addr < main_base + linker->main_map_size)
-      return linker;
-
-    for (int j = 0; j < linker->dep_count; j++) {
-      struct loaded_dep *dep = &linker->dependencies[j];
-      if (!dep->img || !dep->is_manual_load || dep->map_size == 0) continue;
-
-      uintptr_t dep_base = (uintptr_t)dep->img->base;
-      if (addr >= dep_base && addr < dep_base + dep->map_size)
+      uintptr_t main_base = (uintptr_t)linker->img->base;
+      if (addr >= main_base && addr < main_base + linker->main_map_size)
         return linker;
-    }
-  }
 
-  return NULL;
-}
+      for (int j = 0; j < linker->dep_count; j++) {
+        struct loaded_dep *dep = &linker->dependencies[j];
+        if (!dep->img || !dep->is_manual_load || dep->map_size == 0) continue;
+
+        uintptr_t dep_base = (uintptr_t)dep->img->base;
+        if (addr >= dep_base && addr < dep_base + dep->map_size)
+          return linker;
+      }
+    }
+
+    return NULL;
+  }
+#endif /* CSOLOADER_MAKE_LINKER_HOOKS */
 
 static inline uintptr_t _page_start(uintptr_t addr) {
   return ALIGN_DOWN(addr, system_page_size);
