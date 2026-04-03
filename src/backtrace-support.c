@@ -191,7 +191,15 @@ static uintptr_t decode_eh_value(uint8_t enc, const uint8_t **p, uintptr_t base,
     default: break;
   }
 
-  if (indir) value = *(const uintptr_t *)(const void *)value;
+  if (indir) {
+    if (!value) {
+      LOGE("Failed to decode indirect .eh_frame_hdr value: pointer is NULL");
+
+      return 0;
+    }
+
+    value = *(const uintptr_t *)(const void *)value;
+  }
 
   return value;
 }
