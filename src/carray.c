@@ -97,7 +97,7 @@ bool carray_add(struct carray *carr, const char *str) {
 
   LOGW("Carray is full, expanding size");
 
-  size_t new_size = carr->size * 2;
+  size_t new_size = carr->size > 0 ? carr->size * 2 : 1;
   char **new_array = (char **)realloc(carr->array, new_size * sizeof(char *));
   if (!new_array) {
     LOGE("Failed to expand carray");
@@ -106,9 +106,7 @@ bool carray_add(struct carray *carr, const char *str) {
   }
 
   carr->array = new_array;
-  for (size_t i = carr->size; i < new_size; i++) {
-    carr->array[i] = NULL;
-  }
+  memset(&carr->array[carr->size], 0, (new_size - carr->size) * sizeof(char *));
   carr->size = new_size;
 
   carr->array[carr->length] = strdup(str);
