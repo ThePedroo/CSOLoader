@@ -991,6 +991,7 @@ static size_t g_tls_generation = 0;
 static pthread_mutex_t g_tls_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_key_t g_tls_key;
+static bool g_tls_key_initialized = false;
 static pthread_once_t g_tls_key_once = PTHREAD_ONCE_INIT;
 
 /* INFO: This structure is used to access thread-local storage (TLS) variables. 
@@ -1043,6 +1044,7 @@ static void *_linker_allocate_module_tls(struct tls_module *mod) {
 
 static struct thread_tls *_linker_get_thread_tls(void) {
   pthread_once(&g_tls_key_once, _linker_alloc_tls_key_once);
+  g_tls_key_initialized = true;
 
   struct thread_tls *ttls = (struct thread_tls *)pthread_getspecific(g_tls_key);
   if (!ttls) {
