@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/auxv.h>
@@ -178,6 +179,38 @@ static inline uintptr_t _page_start(uintptr_t addr) {
 static inline uintptr_t _page_end(uintptr_t addr) {
   return ALIGN_DOWN(addr + system_page_size - 1, system_page_size);
 }
+
+#ifdef __LP64__
+  /* INFO: Pick the start of the highest parsed 4GiB+ gap so the mapping stays
+             high and leaves more free space above it, where the process is more
+             likely to create VMAs later. */
+  static void *_linker_find_highest_gap_start(size_t needed_size) {
+    FILE *fp = fopen("/proc/self/maps", "re");
+    if (!fp) return NULL;
+
+    needed_size = _page_end(needed_size);
+
+    char *line = NULL;
+    size_t line_cap = 0;
+    uintptr_t prev_end = 0;
+    uintptr_t hint = 0;
+
+    while (getline(&line, &line_cap, fp) != -1) {
+      uintptr_t start = 0;
+      uintptr_t end = 0;
+      if (sscanf(line, "%" PRIxPTR "-%" PRIxPTR, &start, &end) != 2) continue;
+
+      uintptr_t gap_start = _page_end(prev_end ? prev_end : 0x100000000ULL);
+      if (start > gap_start && needed_size <= start - gap_start) hint = gap_start;
+      if (end > prev_end) prev_end = end;
+    }
+
+    free(line);
+    fclose(fp);
+
+    return (void *)hint;
+  }
+#endif
 
 /* INFO: Internal functions START */
 
@@ -701,10 +734,28 @@ void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out)
     return NULL;
   }
 
-  /* One PROT_NONE hole big enough for everything */
-  void *base = mmap(NULL, out->map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  #ifdef __LP64__
+    void *hint = _linker_find_highest_gap_start(out->map_size);
+    if (!hint) {
+      LOGE("Failed to find high mmap hint for %s", lib_path);
+
+      close(fd);
+
+      free(phdr);
+
+      return NULL;
+    }
+
+    void *base = mmap(hint, out->map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  #else
+    void *base = mmap(NULL, out->map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  #endif
   if (base == MAP_FAILED) {
-    LOGE("Failed to reserve address space: %s", strerror(errno));
+    #ifdef __LP64__
+      LOGE("Failed to reserve address space at hint %p for %s: %s", hint, lib_path, strerror(errno));
+    #else
+      LOGE("Failed to reserve address space for %s: %s", lib_path, strerror(errno));
+    #endif
 
     close(fd);
 
@@ -712,6 +763,8 @@ void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out)
 
     return NULL;
   }
+
+  LOGD("Allocated address space for SO loading at %p (size %zu): %s", base, out->map_size, lib_path);
 
   ElfW(Addr) bias = (ElfW(Addr))base - min_vaddr;
 
