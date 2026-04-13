@@ -18,7 +18,7 @@ CFLAGS_BASE = -std=c99 -DANDROID -fPIC -Wno-int-conversion           \
 	          -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Iinclude
 
 CFLAGS_debug = $(CFLAGS_BASE) -g -O0 -DCSOLOADER_DEBUG
-CFLAGS_release = $(CFLAGS_BASE) -O3
+CFLAGS_release = $(CFLAGS_BASE) -O3 -flto
 
 BUILD_TYPE ?= debug
 out ?= build/$(BUILD_TYPE)/$(ARCH)
