@@ -1886,7 +1886,7 @@ static bool _linker_process_relocations(struct linker *linker, struct loaded_dep
             LOGF("REL relocations should not have addends, but found one in group %llu", (unsigned long long)i);
         }
 
-        for (size_t i = 0; i < group_size; ++i) {
+        for (size_t j = 0; j < group_size; ++j) {
           if (group_flags & RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG) {
             unified_r.r_offset += group_r_offset_delta;
           } else {
@@ -1897,7 +1897,7 @@ static bool _linker_process_relocations(struct linker *linker, struct loaded_dep
             unified_r.sym_idx = ELF_R_SYM(r_info);
             unified_r.type = ELF_R_TYPE(r_info);
 
-            LOGD("Group %llu: r_info: %llu, sym_idx: %u, type: %u", (unsigned long long)i, (unsigned long long)r_info, unified_r.sym_idx, unified_r.type);
+            LOGD("Group %llu: r_info: %llu, sym_idx: %u, type: %u", (unsigned long long)j, (unsigned long long)r_info, unified_r.sym_idx, unified_r.type);
           }
 
           if (is_rela && group_flags_reloc == RELOCATION_GROUP_HAS_ADDEND_FLAG)
