@@ -370,6 +370,7 @@ static bool _linker_find_library_path(const char *lib_name, char *full_path, siz
   const char *search_paths[] = {
     #ifdef __LP64__
       #ifdef __ANDROID__
+        "/apex/com.android.tethering/lib64/",
         "/apex/com.android.runtime/lib64/bionic/",
         "/apex/com.android.runtime/lib64/",
         "/apex/com.android.os.statsd/lib64/",
@@ -385,6 +386,7 @@ static bool _linker_find_library_path(const char *lib_name, char *full_path, siz
       #endif
     #else
       #ifdef __ANDROID__
+        "/apex/com.android.tethering/lib/",
         "/apex/com.android.runtime/lib/bionic/",
         "/apex/com.android.runtime/lib/",
         "/apex/com.android.os.statsd/lib/",
@@ -527,7 +529,7 @@ static void _linker_run_dependency_destructors(struct loaded_dep *dep) {
   unregister_custom_library_for_backtrace(dep->img);
 }
 
-static void _linker_release_dependency(struct linker *linker, int index) {
+static void _linker_release_dependency(struct linker *linker, int index, bool unload) {
   struct loaded_dep *dep = &linker->dependencies[index];
   if (!dep->img) return;
 
@@ -539,11 +541,11 @@ static void _linker_release_dependency(struct linker *linker, int index) {
   dep->img = NULL;
   dep->map_size = 0;
 
-  if (dep->is_manual_load && dep_map_size > 0)
+  if (unload && dep->is_manual_load && dep_map_size > 0)
     munmap(dep_base, dep_map_size);
 }
 
-static void _linker_release_dependencies(struct linker *linker, bool run_destructors) {
+static void _linker_release_dependencies(struct linker *linker, bool unload, bool run_destructors) {
   if (run_destructors) {
     for (int i = 0; i < linker->dep_count; i++) {
       _linker_run_dependency_destructors(&linker->dependencies[i]);
@@ -551,7 +553,7 @@ static void _linker_release_dependencies(struct linker *linker, bool run_destruc
   }
 
   for (int i = linker->dep_count - 1; i >= 0; --i)
-    _linker_release_dependency(linker, i);
+    _linker_release_dependency(linker, i, unload);
 }
 
 void linker_destroy(struct linker *linker) {
@@ -564,7 +566,7 @@ void linker_destroy(struct linker *linker) {
     unregister_custom_library_for_backtrace(linker->img);
   }
   
-  _linker_release_dependencies(linker, linker->is_linked);
+  _linker_release_dependencies(linker, true, linker->is_linked);
 
   _linker_unregister(linker);
 
@@ -582,7 +584,7 @@ void linker_destroy(struct linker *linker) {
 
 /* INFO: Free resources related to the library without unloading it */
 void linker_abandon(struct linker *linker) {
-  _linker_release_dependencies(linker, false);
+  _linker_release_dependencies(linker, false, false);
 
   if (linker->img && linker->is_linked) {
     unregister_eh_frame_for_library(linker->img);
