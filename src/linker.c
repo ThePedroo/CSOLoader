@@ -276,53 +276,6 @@ static const char *_path_basename(const char *path) {
   return slash ? slash + 1 : path;
 }
 
-static int _linker_find_dep_index(struct linker *linker, const char *soname) {
-  if (!linker || !soname) return -1;
-
-  for (int i = 0; i < linker->dep_count; i++) {
-    struct loaded_dep *dep = &linker->dependencies[i];
-    if (dep->img && dep->is_manual_load && strcmp(_path_basename(dep->img->elf), soname) == 0) return i;
-  }
-
-  return -1;
-}
-static bool _linker_call_manual_constructors(struct linker *linker, int index, unsigned char *constructor_state) {
-  struct loaded_dep *dep = &linker->dependencies[index];
-  if (!dep->img || !dep->is_manual_load) return true;
-  if (constructor_state[index]) return constructor_state[index] == 2;
-
-  constructor_state[index] = 1;
-
-  if (dep->img->strtab_start) {
-    ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)dep->img->header + dep->img->header->e_phoff);
-    ElfW(Dyn) *dyn = NULL;
-
-    for (int i = 0; i < dep->img->header->e_phnum; i++) {
-      if (phdr[i].p_type != PT_DYNAMIC) continue;
-
-      dyn = (ElfW(Dyn) *)((uintptr_t)dep->img->base + phdr[i].p_vaddr - dep->img->bias);
-      break;
-    }
-
-    for (ElfW(Dyn) *d = dyn; dyn && d->d_tag != DT_NULL; ++d) {
-      if (d->d_tag != DT_NEEDED) continue;
-
-      const char *dep_name = (const char *)dep->img->strtab_start + d->d_un.d_val;
-      if (!dep_name || dep_name[0] == '\0' || strcmp(dep_name, "ld-android.so") == 0) continue;
-
-      int dep_idx = _linker_find_dep_index(linker, dep_name);
-      if (dep_idx < 0) continue;
-
-      if (!_linker_call_manual_constructors(linker, dep_idx, constructor_state))
-        return false;
-    }
-  }
-
-  _linker_call_constructors(dep->img);
-  constructor_state[index] = 2;
-
-  return true;
-}
 
 static int _linker_protect_gnu_relro(struct csoloader_elf *img) {
   ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
@@ -403,8 +356,6 @@ static bool _linker_find_library_path(const char *lib_name, char *full_path, siz
     "/usr/local/lib/",
     NULL
   };
-
-  /* TODO: Read ldconfig */
 
   for (int i = 0; search_paths[i] != NULL; ++i) {
     snprintf(full_path, full_path_size, "%s%s", search_paths[i], lib_name);
@@ -2306,22 +2257,12 @@ bool linker_link(struct linker *linker) {
              we are not a system linker that needs to start off everything. */
   // _linker_call_preinit_constructors(linker->img);
 
-  /* TODO: Simplify this (constructors calling).. it's a mess, but it works great */
-  /* INFO: Dependencies have their constructors called before the main elf.
-             A manual dependency runs only after its manual DT_NEEDED deps. */
-  unsigned char constructor_state[MAX_DEPS] = { 0 };
-  for (int i = 0; i < linker->dep_count; i++) {
-    if (!linker->dependencies[i].is_manual_load) continue;
-
-    _linker_call_manual_constructors(linker, i, constructor_state);
-  }
-
-  for (int i = 0; i < linker->dep_count; i++) {
+  /* INFO: Dependencies have their constructors called before the main elf. */
+  for (int i = linker->dep_count - 1; i >= 0; --i) {
     struct loaded_dep *dep = &linker->dependencies[i];
-    if (!dep->is_manual_load || constructor_state[i] == 2) continue;
+    if (!dep->is_manual_load || !dep->img) continue;
 
     _linker_call_constructors(dep->img);
-    constructor_state[i] = 2;
   }
 
   _linker_call_constructors(linker->img);
