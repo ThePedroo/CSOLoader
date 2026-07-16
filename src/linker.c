@@ -1943,15 +1943,6 @@ static void _linker_restore_protections(struct csoloader_elf *image) {
   free(page_protections);
 }
 
-struct relro_region {
-  void  *addr;
-  size_t size;
-};
-
-#define MAX_RELRO 8
-struct relro_region relro_regions[MAX_RELRO];
-size_t relro_count = 0;
-
 bool linker_link(struct linker *linker) {
   struct carray *loaded_libs = carray_create(64);
   if (!loaded_libs) {
