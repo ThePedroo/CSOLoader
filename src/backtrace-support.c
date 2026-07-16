@@ -28,11 +28,7 @@ struct custom_lib_info {
   struct csoloader_elf *img;
   struct dl_phdr_info phdr_info;
   bool in_use;
-  ElfW(Phdr) *phdr_copy;
-
-  /* INFO: Broken! */
   void *eh_frame_registered;
-  size_t eh_frame_size;
 };
 
 /* TODO: Transform into a dynamic structure to remove limitations */
@@ -77,48 +73,6 @@ static uint64_t read_uleb128(const uint8_t **p, const uint8_t *end) {
 #define DW_EH_PE_datarel  0x30
 #define DW_EH_PE_indirect 0x80
 
-static int read_u16(const uint8_t **p, const uint8_t *end, uint16_t *out) {
-  if ((size_t)(end - *p) < sizeof(uint16_t)) {
-    return -1;
-  }
-
-  uint16_t v = 0;
-  memcpy(&v, *p, sizeof(uint16_t));
-
-  *p += sizeof(uint16_t);
-  *out = v;
-
-  return 0;
-}
-
-static int read_u32(const uint8_t **p, const uint8_t *end, uint32_t *out) {
-  if ((size_t)(end - *p) < sizeof(uint32_t)) {
-    return -1;
-  }
-
-  uint32_t v = 0;
-  memcpy(&v, *p, sizeof(uint32_t));
-
-  *p += sizeof(uint32_t);
-  *out = v;
-
-  return 0;
-}
-
-static int read_u64(const uint8_t **p, const uint8_t *end, uint64_t *out) {
-  if ((size_t)(end - *p) < sizeof(uint64_t)) {
-    return -1;
-  }
-
-  uint64_t v = 0;
-  memcpy(&v, *p, sizeof(uint64_t));
-
-  *p += sizeof(uint64_t);
-  *out = v;
-
-  return 0;
-}
-
 static uintptr_t decode_eh_value(uint8_t enc, const uint8_t **p, uintptr_t base, uintptr_t data_base, const uint8_t *end) {
   if (enc == DW_EH_PE_omit) return 0;
 
@@ -127,12 +81,21 @@ static uintptr_t decode_eh_value(uint8_t enc, const uint8_t **p, uintptr_t base,
   int indir = (enc & DW_EH_PE_indirect) != 0;
 
   uintptr_t value = 0;
+  #define READ_VALUE(type, cast_type) do {          \
+    type raw = 0;                                   \
+    if ((size_t)(end - *p) < sizeof(raw)) return 0; \
+                                                    \
+    memcpy(&raw, *p, sizeof(raw));                  \
+    *p += sizeof(raw);                              \
+    value = (uintptr_t)(cast_type)raw;              \
+  } while (0)
+
   switch (fmt) {
     case DW_EH_PE_ptr: {
       #ifdef __LP64__
-        if (read_u64(p, end, (uintptr_t *)&value) != 0) return 0;
+        READ_VALUE(uint64_t, uint64_t);
       #else
-        if (read_u32(p, end, (uintptr_t *)&value) != 0) return 0;
+        READ_VALUE(uint32_t, uint32_t);
       #endif
 
       break;
@@ -143,41 +106,32 @@ static uintptr_t decode_eh_value(uint8_t enc, const uint8_t **p, uintptr_t base,
       break;
     }
     case DW_EH_PE_udata2: {
-      if (read_u16(p, end, (uint16_t *)&value) != 0) return 0;
+      READ_VALUE(uint16_t, uint16_t);
 
       break;
     }
     case DW_EH_PE_udata4: {
-      if (read_u32(p, end, (uint32_t *)&value) != 0) return 0;
+      READ_VALUE(uint32_t, uint32_t);
 
       break;
     }
     case DW_EH_PE_udata8: {
-      if (read_u64(p, end, (uint64_t *)&value) != 0) return 0;
+      READ_VALUE(uint64_t, uint64_t);
 
       break;
     }
     case DW_EH_PE_sdata2: {
-      uint16_t raw = 0;
-      if (read_u16(p, end, &raw) != 0) return 0;
-
-      value = (uintptr_t)(intptr_t)(int16_t)raw;
+      READ_VALUE(uint16_t, int16_t);
 
       break;
     }
     case DW_EH_PE_sdata4: {
-      uint32_t raw = 0;
-      if (read_u32(p, end, &raw) != 0) return 0;
-
-      value = (uintptr_t)(intptr_t)(int32_t)raw;
+      READ_VALUE(uint32_t, int32_t);
 
       break;
     }
     case DW_EH_PE_sdata8: {
-      uint64_t raw = 0;
-      if (read_u64(p, end, &raw) != 0) return 0;
-
-      value = (uintptr_t)(intptr_t)(int64_t)raw;
+      READ_VALUE(uint64_t, int64_t);
 
       break;
     }
@@ -202,11 +156,20 @@ static uintptr_t decode_eh_value(uint8_t enc, const uint8_t **p, uintptr_t base,
   }
 
   return value;
+
+  #undef READ_VALUE
 }
 
 static int locate_eh_frame_ptr(struct csoloader_elf *img, void **out_ptr, size_t *out_size) {
   *out_ptr = NULL;
   if (out_size) *out_size = 0;
+
+  if (img->eh_frame) {
+    *out_ptr = (void *)img->eh_frame;
+    if (out_size) *out_size = img->eh_frame_size;
+
+    return 0;
+  }
 
   /* INFO: Try to find .eh_frame (direct) first */
   if (img->section_header && img->header->e_shstrndx != SHN_UNDEF && img->header->e_shstrndx < img->header->e_shnum) {
@@ -284,22 +247,23 @@ static int locate_eh_frame_ptr(struct csoloader_elf *img, void **out_ptr, size_t
 int custom_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *), void *data) {
   /* INFO: Must be resolved via dl_iterate_phdr to ensure we don't enter 
              a loop, see our "hook" for dladdr in the code below. */
-  struct csoloader_elf *libdl_elf = csoloader_elf_create("libdl.so", NULL);
-  if (!libdl_elf) {
-    LOGE("Failed to open libdl.so via csoloader_elf");
-
-    return -1;
-  }
-
-  int (*original_dl_iterate_phdr)(int (*callback)(struct dl_phdr_info *, size_t, void *), void *) = (int (*)(int (*)(struct dl_phdr_info *, size_t, void *), void *))csoloader_elf_symb_address(libdl_elf, "dl_iterate_phdr");
+  static int (*original_dl_iterate_phdr)(int (*callback)(struct dl_phdr_info *, size_t, void *), void *);
   if (!original_dl_iterate_phdr) {
-    LOGE("Failed to locate original dl_iterate_phdr in libdl.so");
+    struct csoloader_elf *libdl_elf = csoloader_elf_create("libdl.so", NULL);
+    if (!libdl_elf) {
+      LOGE("Failed to open libdl.so via csoloader_elf");
 
+      return -1;
+    }
+
+    original_dl_iterate_phdr = (int (*)(int (*)(struct dl_phdr_info *, size_t, void *), void *))csoloader_elf_symb_address(libdl_elf, "dl_iterate_phdr");
     csoloader_elf_destroy(libdl_elf);
+    if (!original_dl_iterate_phdr) {
+      LOGE("Failed to locate original dl_iterate_phdr in libdl.so");
 
-    return -1;
+      return -1;
+    }
   }
-  csoloader_elf_destroy(libdl_elf);
 
   int result = original_dl_iterate_phdr(callback, data);
   if (result != 0) return result;
@@ -329,23 +293,23 @@ int custom_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *
 int custom_dladdr(const void *addr, Dl_info *info) {
   /* INFO: Must be resolved via dladdr to ensure we don't enter a loop, see our
              "hook" for dladdr in the code below. */
-  struct csoloader_elf *libdl_elf = csoloader_elf_create("libdl.so", NULL);
-  if (!libdl_elf) {
-    LOGE("Failed to open libdl.so via csoloader_elf");
-
-    return -1;
-  }
-
-  int (*original_dladdr)(const void *, Dl_info *) = (int (*)(const void *, Dl_info *))csoloader_elf_symb_address(libdl_elf, "dladdr");
+  static int (*original_dladdr)(const void *, Dl_info *);
   if (!original_dladdr) {
-    LOGE("Failed to locate original dladdr in libdl.so");
+    struct csoloader_elf *libdl_elf = csoloader_elf_create("libdl.so", NULL);
+    if (!libdl_elf) {
+      LOGE("Failed to open libdl.so via csoloader_elf");
 
+      return -1;
+    }
+
+    original_dladdr = (int (*)(const void *, Dl_info *))csoloader_elf_symb_address(libdl_elf, "dladdr");
     csoloader_elf_destroy(libdl_elf);
+    if (!original_dladdr) {
+      LOGE("Failed to locate original dladdr in libdl.so");
 
-    return -1;
+      return -1;
+    }
   }
-
-  csoloader_elf_destroy(libdl_elf);
 
   if (original_dladdr(addr, info))
     return 1;
@@ -356,10 +320,6 @@ int custom_dladdr(const void *addr, Dl_info *info) {
 
     bool in_range = false;
 
-    uintptr_t seg_min = (uintptr_t)-1;
-    uintptr_t seg_max = 0;
-    bool have_segments = false;
-
     if (g_custom_libs[i].phdr_info.dlpi_phdr && g_custom_libs[i].phdr_info.dlpi_phnum > 0) {
       for (size_t ph = 0; ph < g_custom_libs[i].phdr_info.dlpi_phnum; ph++) {
         ElfW(Phdr) *phdr = (ElfW(Phdr) *)&g_custom_libs[i].phdr_info.dlpi_phdr[ph];
@@ -368,19 +328,8 @@ int custom_dladdr(const void *addr, Dl_info *info) {
         uintptr_t seg_start = (uintptr_t)g_custom_libs[i].phdr_info.dlpi_addr + phdr->p_vaddr;
         uintptr_t seg_end = seg_start + phdr->p_memsz;
 
-        if (!have_segments || seg_start < seg_min) seg_min = seg_start;
-        if (!have_segments || seg_end > seg_max) seg_max = seg_end;
-        have_segments = true;
-
         if ((uintptr_t)addr >= seg_start && (uintptr_t)addr < seg_end) in_range = true;
       }
-    }
-
-    if (have_segments) {
-      LOGD("Custom lib %s segments cover %p - %p", g_custom_libs[i].phdr_info.dlpi_name, (void *)seg_min, (void *)seg_max);
-      LOGD("Checking if address %p falls in any segment", addr);
-    } else {
-      LOGD("Custom lib %s has no loadable segments", g_custom_libs[i].phdr_info.dlpi_name);
     }
 
     if (!in_range) continue;
@@ -416,34 +365,19 @@ int custom_dladdr(const void *addr, Dl_info *info) {
 //   return custom_dladdr(addr, info);
 // }
 
-static ElfW(Phdr) *copy_program_headers(struct csoloader_elf *img) {
-  size_t phdr_size = img->header->e_phnum * sizeof(ElfW(Phdr));
-  ElfW(Phdr) *phdr_copy = (ElfW(Phdr) *)malloc(phdr_size);
-  if (!phdr_copy) {
-    LOGE("Failed to allocate memory for program header copy");
-
-    return NULL;
-  }
-
-  ElfW(Phdr) *original_phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
-  memcpy(phdr_copy, original_phdr, phdr_size);
-
-  return phdr_copy;
-}
-
 bool register_custom_library_for_backtrace(struct csoloader_elf *img) {
   pthread_mutex_lock(&g_custom_libs_mutex);
 
-  int slot = -1;
+  struct custom_lib_info *lib_info = NULL;
   for (int i = 0; i < MAX_CUSTOM_LIBS; i++) {
     if (g_custom_libs[i].in_use) continue;
     
-    slot = i;
+    lib_info = &g_custom_libs[i];
 
     break;
   }
 
-  if (slot == -1) {
+  if (!lib_info) {
     pthread_mutex_unlock(&g_custom_libs_mutex);
 
     LOGE("No available slots for custom library registration");
@@ -451,35 +385,18 @@ bool register_custom_library_for_backtrace(struct csoloader_elf *img) {
     return false;
   }
 
-  struct custom_lib_info *lib_info = &g_custom_libs[slot];
-  lib_info->phdr_copy = copy_program_headers(img);
-  if (!lib_info->phdr_copy) {
-    pthread_mutex_unlock(&g_custom_libs_mutex);
-
-    LOGE("Failed to copy program headers for custom library %s", img->elf);
-
-    return false;
-  }
-
   lib_info->phdr_info.dlpi_addr = (ElfW(Addr))img->base - img->bias;
   lib_info->phdr_info.dlpi_name = img->elf;
-  lib_info->phdr_info.dlpi_phdr = lib_info->phdr_copy;
+  lib_info->phdr_info.dlpi_phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
   lib_info->phdr_info.dlpi_phnum = img->header->e_phnum;
   lib_info->phdr_info.dlpi_adds = 1;
   lib_info->phdr_info.dlpi_subs = 0;
-
-  if (img->tls_segment) {
-    lib_info->phdr_info.dlpi_tls_modid = img->tls_mod_id;
-    lib_info->phdr_info.dlpi_tls_data = NULL;
-  } else {
-    lib_info->phdr_info.dlpi_tls_modid = 0;
-    lib_info->phdr_info.dlpi_tls_data = NULL;
-  }
+  lib_info->phdr_info.dlpi_tls_modid = img->tls_segment ? img->tls_mod_id : 0;
+  lib_info->phdr_info.dlpi_tls_data = NULL;
 
   lib_info->img = img;
   lib_info->in_use = true;
   lib_info->eh_frame_registered = NULL;
-  lib_info->eh_frame_size = 0;
 
   pthread_mutex_unlock(&g_custom_libs_mutex);
 
@@ -500,7 +417,6 @@ bool unregister_custom_library_for_backtrace(struct csoloader_elf *img) {
       g_custom_libs[i].eh_frame_registered = NULL;
     }
 
-    if (g_custom_libs[i].phdr_copy) free(g_custom_libs[i].phdr_copy);
     memset(&g_custom_libs[i], 0, sizeof(struct custom_lib_info));
 
     pthread_mutex_unlock(&g_custom_libs_mutex);
@@ -547,7 +463,6 @@ void register_eh_frame_for_library(struct csoloader_elf *img) {
       if (!g_custom_libs[i].in_use || g_custom_libs[i].img != img) continue;
 
       g_custom_libs[i].eh_frame_registered = eh_frame_ptr;
-      g_custom_libs[i].eh_frame_size = eh_frame_size;
 
       break;
     }

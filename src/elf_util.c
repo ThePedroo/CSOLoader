@@ -145,13 +145,6 @@ void csoloader_elf_destroy(struct csoloader_elf *img) {
   if (!img) return;
 
   if (img->symtabs_) {
-    size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
-    if (valid_symtabs_amount > 0) {
-      for (size_t i = 0; i < valid_symtabs_amount; i++) {
-        free(img->symtabs_[i].name);
-      }
-    }
-
     free(img->symtabs_);
     img->symtabs_ = NULL;
   }
@@ -645,14 +638,14 @@ static bool load_symtabs(struct csoloader_elf *img) {
     return false;
   }
 
-  size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
-  if (valid_symtabs_amount == 0) {
+  img->symtabs_count_ = calculate_valid_symtabs_amount(img);
+  if (img->symtabs_count_ == 0) {
     LOGW("No valid symbols (FUNC/OBJECT with size > 0) found in .symtab for %s", img->elf);
 
     return false;
   }
 
-  img->symtabs_ = (struct symtabs *)calloc(valid_symtabs_amount, sizeof(struct symtabs));
+  img->symtabs_ = calloc(img->symtabs_count_, sizeof(ElfW(Sym *)));
   if (!img->symtabs_) {
     LOGE("Failed to allocate memory for symtabs array");
 
@@ -678,24 +671,10 @@ static bool load_symtabs(struct csoloader_elf *img) {
         continue;
       }
 
-      img->symtabs_[current_valid_index].name = strdup(st_name);
-      if (!img->symtabs_[current_valid_index].name) {
-        LOGE("Failed to duplicate symbol name: %s", st_name);
-
-        for(size_t k = 0; k < current_valid_index; ++k) {
-          free(img->symtabs_[k].name);
-        }
-
-        free(img->symtabs_);
-        img->symtabs_ = NULL;
-
-        return false;
-      }
-
-      img->symtabs_[current_valid_index].sym = current_sym;
+      img->symtabs_[current_valid_index] = current_sym;
 
       current_valid_index++;
-      if (current_valid_index == valid_symtabs_amount) break;
+      if (current_valid_index == img->symtabs_count_) break;
     }
   }
 
@@ -826,8 +805,7 @@ static ElfW(Addr) linear_symbol_lookup_by_prefix(struct csoloader_elf *img, cons
     return 0;
   }
 
-  size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
-  if (valid_symtabs_amount == 0) {
+  if (img->symtabs_count_ == 0) {
     LOGW("No valid symbols (FUNC/OBJECT with size > 0) found in .symtab for %s", img->elf);
 
     return 0;
@@ -836,20 +814,17 @@ static ElfW(Addr) linear_symbol_lookup_by_prefix(struct csoloader_elf *img, cons
   size_t prefix_len = strlen(prefix);
   if (prefix_len == 0) return 0;
 
-  for (size_t i = 0; i < valid_symtabs_amount; i++) {
-    if (!img->symtabs_[i].name || strlen(img->symtabs_[i].name) < prefix_len)
+  for (size_t i = 0; i < img->symtabs_count_; i++) {
+    ElfW(Sym) *sym = img->symtabs_[i];
+
+    const char *name = offsetOf_char(img->header, img->symstr_offset_for_symtab) + sym->st_name;
+    if (sym->st_shndx == SHN_UNDEF || strncmp(name, prefix, prefix_len) != 0)
       continue;
 
-    if (strncmp(img->symtabs_[i].name, prefix, prefix_len) != 0)
-      continue;
-
-    if (img->symtabs_[i].sym->st_shndx == SHN_UNDEF)
-      continue;
-
-    unsigned int type = ELF_ST_TYPE(img->symtabs_[i].sym->st_info);
+    unsigned int type = ELF_ST_TYPE(sym->st_info);
     if (sym_type) *sym_type = type;
 
-    return img->symtabs_[i].sym->st_value;
+    return sym->st_value;
   }
 
   return 0;
@@ -991,16 +966,15 @@ struct sym_info csoloader_elf_get_symbol(struct csoloader_elf *img, uintptr_t ad
     };
   }
 
-  size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
-  if (valid_symtabs_amount == 0) {
+  if (img->symtabs_count_ == 0) {
     return (struct sym_info) {
       .name = NULL,
       .address = 0
     };
   }
 
-  for (size_t i = 0; i < valid_symtabs_amount; i++) {
-    ElfW(Sym) *sym = img->symtabs_[i].sym;
+  for (size_t i = 0; i < img->symtabs_count_; i++) {
+    ElfW(Sym) *sym = img->symtabs_[i];
     if (!sym || sym->st_value == 0 || sym->st_size == 0) continue;
 
     ElfW(Addr) sym_start = (ElfW(Addr))((uintptr_t)img->base + sym->st_value - img->bias);
@@ -1008,7 +982,7 @@ struct sym_info csoloader_elf_get_symbol(struct csoloader_elf *img, uintptr_t ad
 
     if (addr >= sym_start && addr < sym_end) {
       return (struct sym_info) {
-        .name = img->symtabs_[i].name,
+        .name = offsetOf_char(img->header, img->symstr_offset_for_symtab) + sym->st_name,
         .address = sym_start
       };
     }

@@ -1087,17 +1087,12 @@ static void _linker_unregister_tls_segment(struct loaded_dep *dep) {
 
   pthread_mutex_unlock(&g_tls_mutex);
   
-  /* INFO: Free all tracked tls_index structures */
-  if (dep->tls_indices.count != 0) {
-    for (size_t i = 0; i < dep->tls_indices.count; i++) {
-      free(dep->tls_indices.indices[i]);
-    }
-    
-    free(dep->tls_indices.indices);
-    dep->tls_indices.indices = NULL;
-    dep->tls_indices.count = 0;
-    dep->tls_indices.capacity = 0;
+  for (size_t i = 0; i < dep->tls_indices.count; i++) {
+    free(dep->tls_indices.indices[i]);
   }
+
+  free(dep->tls_indices.indices);
+  memset(&dep->tls_indices, 0, sizeof(dep->tls_indices));
 }
 
 static bool _track_tls_index(struct tls_indices_data *tls_indices, struct tls_index *ti) {
@@ -1121,26 +1116,6 @@ static bool _track_tls_index(struct tls_indices_data *tls_indices, struct tls_in
   return true;
 }
 
-static struct tls_index *allocate_tls_index_for_symbol(struct csoloader_elf *img, struct tls_indices_data *tls_indices, ElfW(Sym) *dynsym, uint32_t sym_idx, ElfW(Addr) addend) {
-  struct tls_index *ti = malloc(sizeof(*ti));
-  if (!ti) {
-    LOGE("Failed to allocate memory for tls_index");
-
-    return NULL;
-  }
-
-  ti->module = img->tls_mod_id;
-
-  ElfW(Sym) *sym = &dynsym[sym_idx];
-  ti->offset = sym->st_value + addend;
-
-  if (!_track_tls_index(tls_indices, ti)) {
-    LOGW("Failed to track tls_index for cleanup - potential memory leak");
-  }
-
-  return ti;
-}
-
 void *__tls_get_addr(struct tls_index *ti) {
   LOGD("__tls_get_addr called: ti=%p, module=%zu, offset=%zu", ti, (size_t)ti->module, (size_t)ti->offset);
 
@@ -1152,19 +1127,6 @@ void *__tls_get_addr(struct tls_index *ti) {
     return NULL;
   }
 
-  pthread_mutex_lock(&g_tls_mutex);
-
-  struct tls_module *mod = &g_tls_modules[mod_id];
-  if (mod->module_id == 0) {
-    pthread_mutex_unlock(&g_tls_mutex);
-
-    LOGE("Library tried to access unregistered TLS module %zu", mod_id);
-
-    return NULL;
-  }
-
-  pthread_mutex_unlock(&g_tls_mutex);
-
   struct thread_tls *ttls = _linker_get_thread_tls();
   if (!ttls) {
     LOGE("Library tried to access TLS, but thread TLS allocation failed");
@@ -1175,6 +1137,15 @@ void *__tls_get_addr(struct tls_index *ti) {
   _linker_sync_thread_tls(ttls);
 
   pthread_mutex_lock(&g_tls_mutex);
+
+  struct tls_module *mod = &g_tls_modules[mod_id];
+  if (mod->module_id == 0) {
+    pthread_mutex_unlock(&g_tls_mutex);
+
+    LOGE("Library tried to access unregistered TLS module %zu", mod_id);
+
+    return NULL;
+  }
 
   if (!ttls->modules[mod_id]) {
     ttls->modules[mod_id] = _linker_allocate_module_tls(mod);
@@ -1417,7 +1388,6 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
     }
     case R_GENERIC_TLS_DTPMOD: {
       struct csoloader_elf *tls_img = NULL;
-      size_t module_id = 0;
       
       if (r->sym_idx == 0) {
         /* INFO: If not referenced, assume current module */
@@ -1445,10 +1415,9 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
         tls_img = sym.img;
       }
       
-      if (tls_img && tls_img->tls_segment) module_id = tls_img->tls_mod_id;
-      *target_addr = module_id;
+      *target_addr = tls_img && tls_img->tls_segment ? tls_img->tls_mod_id : 0;
 
-      LOGD("TLS: R_GENERIC_TLS_DTPMOD at %p in %s: module_id=%zu", target_addr, dep->img->elf, module_id);
+      LOGD("TLS: R_GENERIC_TLS_DTPMOD at %p in %s: module_id=%zu", target_addr, dep->img->elf, (size_t)*target_addr);
 
       break;
     }
@@ -1462,15 +1431,12 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
       break;
     }
     case R_GENERIC_TLSDESC: {
-      struct csoloader_elf *tls_img = NULL;
-      struct tls_indices_data *target_tls_indices = NULL;
       ElfW(Addr) *desc = target_addr;
+      ElfW(Addr) tls_offset = r->r_addend;
+      struct csoloader_elf *tls_img = dep->img;
+      struct tls_indices_data *target_tls_indices = &dep->tls_indices;
       
-      if (r->sym_idx == 0) {
-        /* INFO: If not referenced, assume current module */
-        tls_img = dep->img;
-        target_tls_indices = &dep->tls_indices;
-      } else {
+      if (r->sym_idx != 0) {
         ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
         uint8_t bind = ELF_ST_BIND(sym_ent->st_info);
         
@@ -1501,6 +1467,7 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
 
         tls_img = sym.img;
         target_tls_indices = sym.tls_indices;
+        tls_offset += sym_ent->st_value;
       }
       
       if (!tls_img || !tls_img->tls_segment) {
@@ -1509,12 +1476,17 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
         return false;
       }
 
-      struct tls_index *ti = allocate_tls_index_for_symbol(tls_img, target_tls_indices, dynsym, r->sym_idx, r->r_addend);
+      struct tls_index *ti = malloc(sizeof(*ti));
       if (!ti) {
         LOGE("Failed to allocate tls_index for TLSDESC in %s", dep->img->elf);
 
         return false;
       }
+
+      ti->module = tls_img->tls_mod_id;
+      ti->offset = tls_offset;
+      if (!_track_tls_index(target_tls_indices, ti))
+        LOGW("Failed to track tls_index for cleanup - potential memory leak");
 
       desc[0] = (ElfW(Addr))&dynamic_tls_resolver;
       desc[1] = (ElfW(Addr))ti;
@@ -1528,13 +1500,10 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
          
          INFO: Since CSOLoader only handles dlopen'd libraries, we cannot support
                  true static TLS. However, we can emulate by computing offset from tpidr. */
-      struct csoloader_elf *tls_img = NULL;
-      ElfW(Addr) tpoff = 0;
+      ElfW(Addr) tls_offset = r->r_addend;
+      struct csoloader_elf *tls_img = dep->img;
       
-      if (r->sym_idx == 0) {
-        /* INFO: If not referenced, assume current module */
-        tls_img = dep->img;
-      } else {
+      if (r->sym_idx != 0) {
         ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
         uint8_t bind = ELF_ST_BIND(sym_ent->st_info);        
         if (bind == STB_LOCAL) {
@@ -1561,6 +1530,7 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
         }
 
         tls_img = sym.img;
+        tls_offset += sym_ent->st_value;
       }
       
       if (!tls_img || !tls_img->tls_segment) {
@@ -1569,10 +1539,9 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
         return false;
       }
 
-      ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
       struct tls_index ti = {
         .module = tls_img->tls_mod_id,
-        .offset = sym_ent->st_value + r->r_addend
+        .offset = tls_offset
       };
 
       void *var_addr = __tls_get_addr(&ti);
@@ -1584,10 +1553,9 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
       
       /* INFO: Store offset from tpidr so that tpidr + offset = var_addr */
       ElfW(Addr) tpidr = _linker_get_tpidr();
-      tpoff = (ElfW(Addr))var_addr - tpidr;
-      *target_addr = tpoff;
+      *target_addr = (ElfW(Addr))var_addr - tpidr;
 
-      LOGD("TLS: R_GENERIC_TLS_TPREL at %p in %s: tpoff=0x%lx (addr=%p, tpidr=0x%lx)", target_addr, dep->img->elf, (unsigned long)tpoff, var_addr, (unsigned long)tpidr);
+      LOGD("TLS: R_GENERIC_TLS_TPREL at %p in %s: tpoff=0x%lx (addr=%p, tpidr=0x%lx)", target_addr, dep->img->elf, (unsigned long)*target_addr, var_addr, (unsigned long)tpidr);
 
       break;
     }
@@ -1870,34 +1838,25 @@ static bool _linker_process_relocations(struct linker *linker, struct loaded_dep
        - relocate_linker by AOSP's linker
   */
   if (jmprel) {
-    LOGD("Processing %s PLT relocations for %s", pltrel_type == DT_RELA ? "RELA" : "REL", dep->img->elf);
+    bool current_is_rela = pltrel_type == DT_RELA;
+    size_t jmprel_ent = current_is_rela ? sizeof(ElfW(Rela)) : sizeof(ElfW(Rel));
 
-    if (pltrel_type == DT_RELA) {
-      for (ElfW(Rela) *r = jmprel; (void *)r < (void *)jmprel + jmprel_sz; r++) {
-        LOGD("Processing PLT relocation of type %llu for %s", (unsigned long long)ELF_R_TYPE(r->r_info), dep->img->elf);
+    LOGD("Processing %s PLT relocations for %s", current_is_rela ? "RELA" : "REL", dep->img->elf);
 
-        struct _linker_unified_r unified_r = {
-          .sym_idx = ELF_R_SYM(r->r_info),
-          .type = ELF_R_TYPE(r->r_info),
-          .r_offset = r->r_offset,
-          .r_addend = pltrel_type == DT_RELA ? r->r_addend : 0
-        };
+    for (size_t i = 0; i < jmprel_sz / jmprel_ent; i++) {
+      void *entry = (char *)jmprel + i * jmprel_ent;
+      ElfW(Addr) r_info = current_is_rela ? ((ElfW(Rela) *)entry)->r_info : ((ElfW(Rel) *)entry)->r_info;
 
-        if (!_linker_process_unified_relocation(linker, dep, &unified_r, load_bias, dynsym, dynstr, true)) return false;
-      }
-    } else {
-      for (ElfW(Rel) *r = jmprel; (void *)r < (void *)jmprel + jmprel_sz; r++) {
-        LOGD("Processing PLT relocation of type %llu for %s", (unsigned long long)ELF_R_TYPE(r->r_info), dep->img->elf);
+      LOGD("Processing PLT relocation of type %llu for %s", (unsigned long long)ELF_R_TYPE(r_info), dep->img->elf);
 
-        struct _linker_unified_r unified_r = {
-          .sym_idx = ELF_R_SYM(r->r_info),
-          .type = ELF_R_TYPE(r->r_info),
-          .r_offset = r->r_offset,
-          .r_addend = 0
-        };
+      struct _linker_unified_r unified_r = {
+        .sym_idx = ELF_R_SYM(r_info),
+        .type = ELF_R_TYPE(r_info),
+        .r_offset = current_is_rela ? ((ElfW(Rela) *)entry)->r_offset : ((ElfW(Rel) *)entry)->r_offset,
+        .r_addend = current_is_rela ? ((ElfW(Rela) *)entry)->r_addend : 0
+      };
 
-        if (!_linker_process_unified_relocation(linker, dep, &unified_r, load_bias, dynsym, dynstr, false)) return false;
-      }
+      if (!_linker_process_unified_relocation(linker, dep, &unified_r, load_bias, dynsym, dynstr, current_is_rela)) return false;
     }
   }
 
@@ -2170,87 +2129,60 @@ bool linker_link(struct linker *linker) {
   g_tls_generation++;
 
   LOGD("Making memory writable for relocations");
-  ElfW(Phdr) *main_phdr = (ElfW(Phdr) *)((uintptr_t)linker->img->header + linker->img->header->e_phoff);
-  for (int j = 0; j < linker->img->header->e_phnum; j++) {
-    if (main_phdr[j].p_type != PT_LOAD || (main_phdr[j].p_flags & PF_W)) continue;
+  for (int i = -1; i < linker->dep_count; i++) {
+    struct csoloader_elf *img = i == -1 ? linker->img : linker->dependencies[i].img;
+    if (i >= 0 && !linker->dependencies[i].is_manual_load) continue;
 
-    void *page_start = (void *)(((uintptr_t)linker->img->base + main_phdr[j].p_vaddr - linker->img->bias) & ~(system_page_size - 1));
-    size_t page_len = _page_end(main_phdr[j].p_vaddr + main_phdr[j].p_memsz) - _page_start(main_phdr[j].p_vaddr);
+    ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
+    for (int j = 0; j < img->header->e_phnum; j++) {
+      if (phdr[j].p_type != PT_LOAD || (phdr[j].p_flags & PF_W)) continue;
 
-    if (mprotect(page_start, page_len, PROT_READ | PROT_WRITE | (main_phdr[j].p_flags & PF_X ? PROT_EXEC : 0)) != 0)
-      LOGW("mprotect failed to make main image segment %d writable: %s", j, strerror(errno));
-  }
+      void *page_start = (void *)_page_start((uintptr_t)img->base + phdr[j].p_vaddr - img->bias);
+      size_t page_len = _page_end(phdr[j].p_vaddr + phdr[j].p_memsz) - _page_start(phdr[j].p_vaddr);
 
-  for (int i = 0; i < linker->dep_count; i++) {
-    struct loaded_dep *dep = &linker->dependencies[i];
-    if (!dep->is_manual_load) continue;
-
-    ElfW(Phdr) *dep_phdr = (ElfW(Phdr) *)((uintptr_t)dep->img->header + dep->img->header->e_phoff);
-    for (int j = 0; j < dep->img->header->e_phnum; j++) {
-      if (dep_phdr[j].p_type != PT_LOAD || (dep_phdr[j].p_flags & PF_W)) continue;
-
-      void *page_start = (void *)(((uintptr_t)dep->img->base + dep_phdr[j].p_vaddr - dep->img->bias) & ~(system_page_size - 1));
-      size_t page_len = _page_end(dep_phdr[j].p_vaddr + dep_phdr[j].p_memsz) - _page_start(dep_phdr[j].p_vaddr);
-
-      if (mprotect(page_start, page_len, PROT_READ | PROT_WRITE | (dep_phdr[j].p_flags & PF_X ? PROT_EXEC : 0)) != 0)
-        LOGW("mprotect failed for make segment %d in %s writable: %s", j, dep->img->elf, strerror(errno));
+      if (mprotect(page_start, page_len, PROT_READ | PROT_WRITE | (phdr[j].p_flags & PF_X ? PROT_EXEC : 0)) != 0)
+        LOGW("mprotect failed for make segment %d in %s writable: %s", j, img->elf, strerror(errno));
     }
   }
 
   LOGD("Processing relocations for main library and dependencies.");
-  if (!_linker_process_relocations(linker, (struct loaded_dep *)linker)) {
-    LOGE("Failed processing relocations for main library: %s", linker->img->elf);
+  for (int i = -1; i < linker->dep_count; i++) {
+    struct loaded_dep *dep = i == -1 ? (struct loaded_dep *)linker : &linker->dependencies[i];
+    if (i >= 0 && !dep->is_manual_load) continue;
 
-    return false;
-  }
-
-  for (int i = 0; i < linker->dep_count; i++) {
-    if (!linker->dependencies[i].is_manual_load) continue;
-
-    if (!_linker_process_relocations(linker, &linker->dependencies[i])) {
-      LOGE("Failed processing relocations for dependency: %s", linker->dependencies[i].img->elf);
+    if (!_linker_process_relocations(linker, dep)) {
+      LOGE("Failed processing relocations for %s", dep->img->elf);
 
       return false;
     }
   }
 
   LOGD("Restoring memory protections after relocations");
-  _linker_restore_protections(linker->img);
+  for (int i = -1; i < linker->dep_count; i++) {
+    struct csoloader_elf *img = i == -1 ? linker->img : linker->dependencies[i].img;
+    if (i >= 0 && !linker->dependencies[i].is_manual_load) continue;
 
-  for (int i = 0; i < linker->dep_count; i++) {
-    struct loaded_dep *dep = &linker->dependencies[i];
-    if (!dep->is_manual_load) continue;
-
-    _linker_restore_protections(dep->img);
+    _linker_restore_protections(img);
   }
 
   LOGD("Applying GNU RELRO protection for main library and dependencies.");
-  if (_linker_protect_gnu_relro(linker->img) != 0) {
-    LOGW("Failed to apply GNU RELRO protection to main library");
+  for (int i = -1; i < linker->dep_count; i++) {
+    struct csoloader_elf *img = i == -1 ? linker->img : linker->dependencies[i].img;
+    if (i >= 0 && !linker->dependencies[i].is_manual_load) continue;
+
+    if (_linker_protect_gnu_relro(img) != 0)
+      LOGW("Failed to apply GNU RELRO protection to %s", img->elf);
   }
 
-  for (int i = 0; i < linker->dep_count; i++) {
-    if (!linker->dependencies[i].is_manual_load) continue;
+  LOGD("Registering backtrace and EH frame information for main library and dependencies.");
+  for (int i = -1; i < linker->dep_count; i++) {
+    struct csoloader_elf *img = i == -1 ? linker->img : linker->dependencies[i].img;
+    if (i >= 0 && !linker->dependencies[i].is_manual_load) continue;
 
-    if (_linker_protect_gnu_relro(linker->dependencies[i].img) != 0) {
-      LOGW("Failed to apply GNU RELRO protection to %s", linker->dependencies[i].img->elf);
-    }
-  }
+    if (!register_custom_library_for_backtrace(img))
+      LOGW("Failed to register %s for backtrace support", img->elf);
 
-  if (!register_custom_library_for_backtrace(linker->img))
-    LOGW("Failed to register main library for backtrace support");
-
-  register_eh_frame_for_library(linker->img);
-
-  for (int i = 0; i < linker->dep_count; i++) {
-    struct loaded_dep *dep = &linker->dependencies[i];
-    if (!dep->is_manual_load) continue;
-
-    if (!register_custom_library_for_backtrace(dep->img)) {
-      LOGW("Failed to register dependency %s for backtrace support", dep->img->elf);
-    }
-
-    register_eh_frame_for_library(dep->img);
+    register_eh_frame_for_library(img);
   }
 
   /* INFO: preinit only is for the main EXECUTABLE. We don't deal with those, not for now, as

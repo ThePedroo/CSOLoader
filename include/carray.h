@@ -8,6 +8,7 @@
 #define CARRAY_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 struct carray;
 
@@ -21,7 +22,7 @@ char *carray_get(struct carray *carr, size_t index);
 
 bool carray_add(struct carray *carr, const char *str);
 
-bool carray_remove(struct carray *carr, const char *str);
+void carray_remove(struct carray *carr, const char *str);
 
 void carray_destroy(struct carray *carr);
 

@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "carray.h"
 #include "logging.h"
 
 struct carray {
@@ -17,7 +18,9 @@ struct carray {
 };
 
 struct carray *carray_create(size_t size) {
-  struct carray *carr = (struct carray *)malloc(sizeof(struct carray));
+  if (size == 0) size = 1;
+
+  struct carray *carr = (struct carray *)calloc(1, sizeof(struct carray));
   if (!carr) {
     LOGE("Failed to allocate memory for carray");
 
@@ -34,7 +37,6 @@ struct carray *carray_create(size_t size) {
   }
 
   carr->size = size;
-  carr->length = 0;
 
   return carr;
 }
@@ -56,15 +58,15 @@ bool carray_exists(struct carray *carr, const char *str) {
     return false;
   }
 
-  for (size_t i = 0; i < carr->size; i++) {
-    if (carr->array[i] && strcmp(carr->array[i], str) == 0) return true;
+  for (size_t i = 0; i < carr->length; i++) {
+    if (strcmp(carr->array[i], str) == 0) return true;
   }
 
   return false;
 }
 
 char *carray_get(struct carray *carr, size_t index) {
-  if (!carr || index >= carr->size) {
+  if (!carr || index >= carr->length) {
     LOGE("Invalid carray or index out of bounds");
 
     return NULL;
@@ -80,85 +82,56 @@ bool carray_add(struct carray *carr, const char *str) {
     return false;
   }
 
-  for (size_t i = 0; i < carr->size; i++) {
-    if (!carr->array[i]) {
-      carr->array[i] = strdup(str);
-      if (!carr->array[i]) {
-        LOGE("Failed to duplicate string: %s", str);
+  if (carr->length == carr->size) {
+    size_t new_size = carr->size * 2;
+    char **new_array = (char **)realloc(carr->array, new_size * sizeof(char *));
+    if (!new_array) {
+      LOGE("Failed to expand carray");
 
-        return false;
-      }
-
-      carr->length++;
-
-      return true;
+      return false;
     }
+
+    carr->array = new_array;
+    carr->size = new_size;
   }
 
-  LOGW("Carray is full, expanding size");
-
-  size_t new_size = carr->size > 0 ? carr->size * 2 : 1;
-  char **new_array = (char **)realloc(carr->array, new_size * sizeof(char *));
-  if (!new_array) {
-    LOGE("Failed to expand carray");
-
-    return false;
-  }
-
-  carr->array = new_array;
-  memset(&carr->array[carr->size], 0, (new_size - carr->size) * sizeof(char *));
-  carr->size = new_size;
-
-  carr->array[carr->length] = strdup(str);
-  if (!carr->array[carr->length]) {
+  char *copy = strdup(str);
+  if (!copy) {
     LOGE("Failed to duplicate string: %s", str);
 
     return false;
   }
-  carr->length++;
+
+  carr->array[carr->length++] = copy;
 
   return true;
 }
 
-bool carray_remove(struct carray *carr, const char *str) {
+void carray_remove(struct carray *carr, const char *str) {
   if (!carr || !str) {
     LOGE("Invalid carray or string to remove");
 
-    return false;
+    return;
   }
 
-  for (size_t i = 0; i < carr->size; i++) {
-    if (carr->array[i] && strcmp(carr->array[i], str) == 0) {
-      free(carr->array[i]);
-      carr->array[i] = NULL;
+  for (size_t i = 0; i < carr->length; i++) {
+    if (strcmp(carr->array[i], str) != 0) continue;
 
-      memmove(&carr->array[i], &carr->array[i + 1], (carr->size - i - 1) * sizeof(char *));
-      carr->array[carr->size - 1] = NULL;
+    free(carr->array[i]);
+    memmove(&carr->array[i], &carr->array[i + 1], (carr->length - i - 1) * sizeof(char *));
+    carr->array[--carr->length] = NULL;
 
-      carr->length--;
-
-      return true;
-    }
+    return;
   }
-
-  LOGW("String not found in carray: %s", str);
-
-  return false;
 }
 
-bool carray_destroy(struct carray *carr) {
-  if (!carr) {
-    LOGE("Invalid carray to destroy");
+void carray_destroy(struct carray *carr) {
+  if (!carr) return;
 
-    return false;
-  }
-
-  for (size_t i = 0; i < carr->size; i++) {
+  for (size_t i = 0; i < carr->length; i++) {
     free(carr->array[i]);
   }
 
   free(carr->array);
   free(carr);
-
-  return true;
 }
