@@ -3,11 +3,11 @@ API_LEVEL ?= 26
 ARCH ?= arm64-v8a
 
 TOOLCHAIN = $(NDK_PATH)/toolchains/llvm/prebuilt/linux-x86_64
-SYSROOT = $(TOOLCHAIN)/sysroot
 
 ifeq ($(TERMUX_VERSION),)
 	CC = $(TOOLCHAIN)/bin/clang
 	AR = $(TOOLCHAIN)/bin/llvm-ar
+	SYSROOT = $(TOOLCHAIN)/sysroot
 else
 	CC = clang
 	AR = llvm-ar
@@ -18,7 +18,11 @@ TARGET_armeabi-v7a = armv7a-linux-androideabi$(API_LEVEL)
 TARGET_x86 = i686-linux-android$(API_LEVEL)
 TARGET_x86_64 = x86_64-linux-android$(API_LEVEL)
 
-CC_ARCH = $(CC) --target=$(TARGET_$(ARCH)) --sysroot=$(SYSROOT)
+ifneq ($(SYSROOT),)
+	CC_ARCH = $(CC) --target=$(TARGET_$(ARCH)) --sysroot=$(SYSROOT)
+else
+	CC_ARCH = $(CC) --target=$(TARGET_$(ARCH))
+endif
 
 CFLAGS_BASE = -std=c99 -DANDROID -fPIC -Wno-int-conversion           \
 	          -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Iinclude
