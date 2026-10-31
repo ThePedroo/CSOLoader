@@ -253,7 +253,7 @@ int custom_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *
     if (!libdl_elf) {
       LOGE("Failed to open libdl.so via csoloader_elf");
 
-      return -1;
+      return 0;
     }
 
     original_dl_iterate_phdr = (int (*)(int (*)(struct dl_phdr_info *, size_t, void *), void *))csoloader_elf_symb_address(libdl_elf, "dl_iterate_phdr");
@@ -261,7 +261,7 @@ int custom_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *
     if (!original_dl_iterate_phdr) {
       LOGE("Failed to locate original dl_iterate_phdr in libdl.so");
 
-      return -1;
+      return 0;
     }
   }
 
@@ -299,7 +299,7 @@ int custom_dladdr(const void *addr, Dl_info *info) {
     if (!libdl_elf) {
       LOGE("Failed to open libdl.so via csoloader_elf");
 
-      return -1;
+      return 0;
     }
 
     original_dladdr = (int (*)(const void *, Dl_info *))csoloader_elf_symb_address(libdl_elf, "dladdr");
@@ -307,7 +307,7 @@ int custom_dladdr(const void *addr, Dl_info *info) {
     if (!original_dladdr) {
       LOGE("Failed to locate original dladdr in libdl.so");
 
-      return -1;
+      return 0;
     }
   }
 
