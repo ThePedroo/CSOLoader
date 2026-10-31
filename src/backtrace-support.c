@@ -387,7 +387,7 @@ bool register_custom_library_for_backtrace(struct csoloader_elf *img) {
 
   lib_info->phdr_info.dlpi_addr = (ElfW(Addr))img->base - img->bias;
   lib_info->phdr_info.dlpi_name = img->elf;
-  lib_info->phdr_info.dlpi_phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
+  lib_info->phdr_info.dlpi_phdr = (ElfW(Phdr) *)((uintptr_t)img->base + img->header->e_phoff);
   lib_info->phdr_info.dlpi_phnum = img->header->e_phnum;
   lib_info->phdr_info.dlpi_adds = 1;
   lib_info->phdr_info.dlpi_subs = 0;
