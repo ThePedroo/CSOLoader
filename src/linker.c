@@ -4,15 +4,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
 #include <errno.h>
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <inttypes.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/auxv.h>
 #include <link.h>
@@ -181,34 +180,53 @@ static inline uintptr_t _page_end(uintptr_t addr) {
 }
 
 #ifdef __LP64__
-  /* INFO: Pick the start of the highest parsed 4GiB+ gap so the mapping stays
-             high and leaves more free space above it, where the process is more
-             likely to create VMAs later. */
-  static void *_linker_find_highest_gap_start(size_t needed_size) {
-    FILE *fp = fopen("/proc/self/maps", "re");
-    if (!fp) return NULL;
+  /* INFO: Reserve size bytes in the highest free place below the stack, so we never take a
+             place the system would later use, which would create a gap, a detection.
 
-    needed_size = _page_end(needed_size);
+           An address given to mmap without MAP_FIXED is only a hint, so we accept only our
+             own, stepping it down one mapping at a time until it is taken, meaning it is free.
+  */
+  static void *_linker_reserve_high(size_t size) {
+    struct rlimit stack_limit;
+    if (getrlimit(RLIMIT_STACK, &stack_limit) == -1 || stack_limit.rlim_cur == RLIM_INFINITY)
+      return MAP_FAILED;
 
-    char *line = NULL;
-    size_t line_cap = 0;
-    uintptr_t prev_end = 0;
-    uintptr_t hint = 0;
+    char here;
+    uintptr_t hint = _page_start((uintptr_t)&here) - (uintptr_t)stack_limit.rlim_cur;
 
-    while (getline(&line, &line_cap, fp) != -1) {
-      uintptr_t start = 0;
-      uintptr_t end = 0;
-      if (sscanf(line, "%" PRIxPTR "-%" PRIxPTR, &start, &end) != 2) continue;
+    /* INFO: The address of a local stands at or above our stack pointer, and our stack can
+               never reach below its own limit: The kernel keeps stack_guard_gap, the gap it
+               enforces between the expanding stack (and other mappings). The default is 256 pages.
 
-      uintptr_t gap_start = _page_end(prev_end ? prev_end : 0x100000000ULL);
-      if (start > gap_start && needed_size <= start - gap_start) hint = gap_start;
-      if (end > prev_end) prev_end = end;
+       SOURCES:
+        - https://github.com/torvalds/linux/blob/14a5c975b1382225e283c867bb6d173cf90233cc/mm/mmap.c#L955
+    */
+    size_t stack_guard_gap = (size_t)getpagesize() * 256;
+
+    size_t map_size = _page_end(size);
+    hint -= stack_guard_gap + map_size;
+
+    /* INFO: To avoid reading /proc/self/maps, which causes detections, and still be able
+               to get a high address, we utilize mmap to probe.
+
+             We start off at a high address, and then we ask the kernel to allocate a VMA there.
+               If the kernel allocates somewhere different from where we wanted (hint), then
+               it is occupied, so we try a bit lower address next, until it gives a VMA
+               exactly where we want. */
+    uintptr_t lowest = 0;
+    while (hint > lowest) {
+      void *base = mmap((void *)hint, map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (base == MAP_FAILED) return base;
+
+      if ((uintptr_t)base == hint) return base;
+
+      if (!lowest) lowest = (uintptr_t)base;
+      munmap(base, map_size);
+
+      hint -= map_size;
     }
 
-    free(line);
-    fclose(fp);
-
-    return (void *)hint;
+    return MAP_FAILED;
   }
 #endif
 
@@ -688,24 +706,13 @@ void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out)
   }
 
   #ifdef __LP64__
-    void *hint = _linker_find_highest_gap_start(out->map_size);
-    if (!hint) {
-      LOGE("Failed to find high mmap hint for %s", lib_path);
-
-      close(fd);
-
-      free(phdr);
-
-      return NULL;
-    }
-
-    void *base = mmap(hint, out->map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    void *base = _linker_reserve_high(out->map_size);
   #else
     void *base = mmap(NULL, out->map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   #endif
   if (base == MAP_FAILED) {
     #ifdef __LP64__
-      LOGE("Failed to reserve address space at hint %p for %s: %s", hint, lib_path, strerror(errno));
+      LOGE("Failed to reserve high address space for %s: %s", lib_path, strerror(errno));
     #else
       LOGE("Failed to reserve address space for %s: %s", lib_path, strerror(errno));
     #endif
